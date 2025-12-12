@@ -46,6 +46,9 @@ def epoch_ms_to_datetime(epoch_ms: int) -> datetime:
 class Database:
     """SQLite database wrapper for message storage."""
 
+    # Current schema version - increment when adding migrations
+    SCHEMA_VERSION = 2
+
     def __init__(self, db_path: str | None = None):
         """Initialize database connection.
 
@@ -63,6 +66,26 @@ class Database:
         self.conn.execute("PRAGMA journal_mode=WAL")
 
         self._init_schema()
+
+    def _get_schema_version(self) -> int:
+        """Get the current schema version from the database.
+
+        Returns:
+            Schema version number, 0 if not set
+        """
+        row = self.conn.execute("PRAGMA user_version").fetchone()
+        return row[0] if row else 0
+
+    def _set_schema_version(self, version: int) -> None:
+        """Set the schema version in the database.
+
+        Args:
+            version: Version number to set
+        """
+        # PRAGMA user_version doesn't support parameters, must use string formatting
+        # This is safe as version is always an int
+        self.conn.execute(f"PRAGMA user_version = {int(version)}")
+        self.conn.commit()
 
     def _init_schema(self) -> None:
         """Initialize database schema.
@@ -108,25 +131,52 @@ class Database:
         self._run_migrations()
 
     def _run_migrations(self) -> None:
-        """Run database migrations for schema updates."""
-        # Check if peers.raw_data column exists and drop it
-        cursor = self.conn.execute("PRAGMA table_info(peers)")
-        columns = [row[1] for row in cursor.fetchall()]
+        """Run database migrations for schema updates.
 
-        if "raw_data" in columns:
-            # SQLite 3.35+ supports ALTER TABLE DROP COLUMN
-            try:
-                self.conn.execute("ALTER TABLE peers DROP COLUMN raw_data")
-                self.conn.commit()
-            except sqlite3.OperationalError:
-                # Older SQLite - just ignore, the column will be unused
-                pass
+        Uses PRAGMA user_version to track schema version and apply
+        migrations incrementally.
+        """
+        current_version = self._get_schema_version()
+
+        # Migration 1: Drop unused raw_data column from peers (if exists)
+        if current_version < 1:
+            cursor = self.conn.execute("PRAGMA table_info(peers)")
+            columns = [row[1] for row in cursor.fetchall()]
+
+            if "raw_data" in columns:
+                # SQLite 3.35+ supports ALTER TABLE DROP COLUMN
+                try:
+                    self.conn.execute("ALTER TABLE peers DROP COLUMN raw_data")
+                    self.conn.commit()
+                except sqlite3.OperationalError:
+                    # Older SQLite - just ignore, the column will be unused
+                    pass
+
+            self._set_schema_version(1)
+            current_version = 1
+
+        # Migration 2: (placeholder for future migrations)
+        # Example of how to add future migrations:
+        # if current_version < 2:
+        #     self.conn.execute("ALTER TABLE messages ADD COLUMN new_field TEXT")
+        #     self.conn.commit()
+        #     self._set_schema_version(2)
+        #     current_version = 2
+
+        # Ensure we're at the current version
+        if current_version < self.SCHEMA_VERSION:
+            self._set_schema_version(self.SCHEMA_VERSION)
 
     def __enter__(self) -> "Database":
         """Context manager entry."""
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: object,
+    ) -> None:
         """Context manager exit - commit if no exception, then close."""
         if exc_type is None:
             self.conn.commit()
@@ -214,6 +264,29 @@ class Database:
             return (0, 0)
 
         return (row["min_msg_id"] or 0, row["max_msg_id"] or 0)
+
+    def get_actual_message_boundaries(self, peer_id: int) -> tuple[int, int]:
+        """Get actual min/max message IDs from messages table.
+
+        This queries the messages table directly to get accurate boundaries,
+        useful for deriving boundaries after commits rather than tracking
+        in-memory which can drift on retry paths.
+
+        Args:
+            peer_id: Telegram peer ID
+
+        Returns:
+            Tuple of (min_msg_id, max_msg_id), (0, 0) if no messages
+        """
+        row = self.conn.execute("""
+            SELECT MIN(id) as min_id, MAX(id) as max_id
+            FROM messages WHERE peer_id = ?
+        """, (peer_id,)).fetchone()
+
+        if row is None or row["min_id"] is None:
+            return (0, 0)
+
+        return (row["min_id"], row["max_id"])
 
     def count_messages(self, peer_id: int) -> int:
         """Count messages for a peer.
@@ -338,23 +411,33 @@ class Database:
             # Re-raise other integrity errors (FK violations, etc.)
             raise
 
-    def insert_messages_batch(self, messages: list[dict]) -> tuple[int, list[str]]:
+    def insert_messages_batch(self, messages: list[dict]) -> int:
         """Insert multiple messages in a batch using executemany.
 
         Uses INSERT OR IGNORE to efficiently handle duplicates without per-row
-        exception handling. The inserted count is calculated via total_changes delta.
+        exception handling. Duplicate messages are silently skipped.
 
         Args:
-            messages: List of message dicts with keys matching insert_message args
+            messages: List of message dicts with keys:
+                - msg_id: Message ID
+                - peer_id: Peer ID
+                - date: datetime object (required)
+                - sender_id: Sender user ID
+                - sender_name: Sender display name
+                - text: Message text
+                - reply_to_msg_id: Reply-to message ID
+                - has_media: Whether message has media
+                - media_type: Type of media
+                - raw_data: JSON dump of message
 
         Returns:
-            Tuple of (inserted_count, list of error messages for non-duplicate failures)
+            Number of messages inserted (duplicates are not counted)
 
         Raises:
             ValueError: If any message has no date
         """
         if not messages:
-            return (0, [])
+            return 0
 
         # Validate and convert dates
         rows = []
@@ -381,10 +464,7 @@ class Database:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, rows)
 
-        inserted = self.conn.total_changes - changes_before
-
-        # No per-row error tracking in fast path - INSERT OR IGNORE handles duplicates
-        return (inserted, [])
+        return self.conn.total_changes - changes_before
 
     def get_messages(
         self,
@@ -452,6 +532,35 @@ class Database:
         cursor = self.conn.execute(query, params)
         yield from cursor
 
+    def _validate_export_filters(
+        self,
+        last_n: int | None,
+        since_id: int | None,
+        until_id: int | None,
+        start_date: datetime | None,
+        end_date: datetime | None,
+    ) -> None:
+        """Validate that export filter parameters are not conflicting.
+
+        Args:
+            last_n: Get last N messages
+            since_id: Minimum message ID (exclusive)
+            until_id: Maximum message ID (exclusive)
+            start_date: Start datetime (inclusive, UTC)
+            end_date: End datetime (inclusive, UTC)
+
+        Raises:
+            ValueError: If last_n is combined with other filters
+        """
+        if last_n is not None:
+            other_filters = [since_id, until_id, start_date, end_date]
+            if any(f is not None for f in other_filters):
+                raise ValueError(
+                    "last_n cannot be combined with other filters "
+                    "(since_id, until_id, start_date, end_date). "
+                    "Use either last_n OR the other filters, not both."
+                )
+
     def get_messages_for_export(
         self,
         peer_id: int,
@@ -468,7 +577,7 @@ class Database:
 
         Args:
             peer_id: Peer ID to query
-            last_n: Get last N messages
+            last_n: Get last N messages (mutually exclusive with other filters)
             since_id: Minimum message ID (exclusive)
             until_id: Maximum message ID (exclusive)
             start_date: Start datetime (inclusive, UTC)
@@ -476,7 +585,12 @@ class Database:
 
         Yields:
             Database rows in chronological order
+
+        Raises:
+            ValueError: If last_n is combined with other filters
         """
+        self._validate_export_filters(last_n, since_id, until_id, start_date, end_date)
+
         if last_n is not None:
             # Use SQL subquery to get last N in chronological order
             # This avoids materializing and reversing in Python
@@ -515,7 +629,7 @@ class Database:
 
         Args:
             peer_id: Peer ID to query
-            last_n: Get last N messages
+            last_n: Get last N messages (mutually exclusive with other filters)
             since_id: Minimum message ID (exclusive)
             until_id: Maximum message ID (exclusive)
             start_date: Start datetime (inclusive, UTC)
@@ -523,7 +637,12 @@ class Database:
 
         Yields:
             Database rows in chronological order with additional reply_sender_name column
+
+        Raises:
+            ValueError: If last_n is combined with other filters
         """
+        self._validate_export_filters(last_n, since_id, until_id, start_date, end_date)
+
         if last_n is not None:
             # Use SQL subquery to get last N with reply sender
             query = """

@@ -39,13 +39,35 @@ ignore = [
     "E501",   # Line length handled separately
     "W293",   # Blank line contains whitespace (auto-formatter handles this)
     "SIM108", # Use ternary - reduces readability in some cases
-    "B904",   # raise from - not always clearer
+    "SIM105", # contextlib.suppress doesn't work with async/await patterns
+    # Note: B904 (raise from) is now enabled for better error debugging
 ]
 
 [tool.mypy]
 python_version = "3.10"
 warn_return_any = true
 warn_unused_ignores = true
-disallow_untyped_defs = false  # Start relaxed, tighten later
 ignore_missing_imports = true
+
+# Note: disallow_untyped_defs is set per-module below
+# Functions accepting Telethon entities or sqlite3.Row need Any annotations
+# which would require custom type stubs
+
+# Stricter type checking for new/clean modules
+[[tool.mypy.overrides]]
+module = ["tgx.main", "tgx.db"]
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+
+# Relaxed for modules with external untyped objects (Telethon entities, sqlite3.Row)
+[[tool.mypy.overrides]]
+module = ["tgx.sync", "tgx.exporter", "tgx.utils", "tgx.client"]
+disallow_untyped_defs = false
+check_untyped_defs = true
+
+# Relaxed for tests
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
 

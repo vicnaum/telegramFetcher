@@ -6,7 +6,6 @@ These tests focus on the tricky correctness issues:
 - Constraint handling (duplicates vs other errors)
 """
 
-import tempfile
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -19,12 +18,13 @@ from tgx.db import (
 
 
 @pytest.fixture
-def db():
-    """Create a temporary database for testing."""
-    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
-        db_path = f.name
+def db(tmp_path):
+    """Create a temporary database for testing.
 
-    database = Database(db_path)
+    Uses pytest's tmp_path fixture for automatic cleanup.
+    """
+    db_path = tmp_path / "test.sqlite"
+    database = Database(str(db_path))
     yield database
     database.close()
 
@@ -310,8 +310,8 @@ class TestDateRangeQueries:
 class TestBatchInsert:
     """Test batch insert operations."""
 
-    def test_batch_insert_returns_count_and_errors(self, db):
-        """Batch insert should return tuple of (count, errors)."""
+    def test_batch_insert_returns_count(self, db):
+        """Batch insert should return inserted count."""
         db.update_peer(123, "test", "Test Peer", "channel")
         db.commit()
 
@@ -331,13 +331,12 @@ class TestBatchInsert:
             for i in range(10)
         ]
 
-        inserted, errors = db.insert_messages_batch(messages)
+        inserted = db.insert_messages_batch(messages)
 
         assert inserted == 10
-        assert errors == []
 
     def test_batch_insert_handles_duplicates(self, db):
-        """Batch insert should skip duplicates without error."""
+        """Batch insert should skip duplicates silently."""
         db.update_peer(123, "test", "Test Peer", "channel")
         db.commit()
 
@@ -358,10 +357,9 @@ class TestBatchInsert:
             for i in range(5)
         ]
 
-        inserted, errors = db.insert_messages_batch(messages)
+        inserted = db.insert_messages_batch(messages)
 
-        assert inserted == 1  # Only first one
-        assert errors == []   # Duplicates aren't errors
+        assert inserted == 1  # Only first one, duplicates silently skipped
 
 
 class TestLimitHandling:
@@ -421,10 +419,9 @@ class TestLimitHandling:
 class TestContextManager:
     """Test database context manager."""
 
-    def test_context_manager_commits_on_success(self):
+    def test_context_manager_commits_on_success(self, tmp_path):
         """Context manager should commit on successful exit."""
-        with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
-            db_path = f.name
+        db_path = str(tmp_path / "context_test.sqlite")
 
         # Insert with context manager
         with Database(db_path) as db:

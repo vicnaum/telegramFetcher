@@ -5,12 +5,21 @@ import asyncio
 import logging
 import signal
 import sys
+from collections.abc import Coroutine
 from datetime import datetime, timezone
+from typing import Any
 
 from dotenv import load_dotenv
 from telethon import TelegramClient
 
-from tgx.client import auth_test, create_client, ensure_authorized, fetch_test, list_dialogs
+from tgx.client import (
+    ConfigurationError,
+    auth_test,
+    create_client,
+    ensure_authorized,
+    fetch_test,
+    list_dialogs,
+)
 from tgx.db import Database
 from tgx.exporter import export_messages
 from tgx.sync import sync_peer
@@ -18,19 +27,27 @@ from tgx.utils import get_display_name, get_peer_id, normalize_peer_input
 
 logger = logging.getLogger(__name__)
 
+# Shutdown timeout for task cancellation
+SHUTDOWN_TIMEOUT = 10.0
+
 # Global references for graceful shutdown
 _current_db: Database | None = None
 _current_client: TelegramClient | None = None
 _shutdown_event: asyncio.Event | None = None
 
 
-def _setup_signal_handlers():
-    """Set up signal handlers for graceful shutdown in async context."""
+def _setup_signal_handlers() -> None:
+    """Set up signal handlers for graceful shutdown in async context.
+
+    On Unix: uses loop.add_signal_handler for proper async signal handling.
+    On Windows: signal handlers are not supported in event loops, so we rely
+    on KeyboardInterrupt handling in the outer wrapper.
+    """
     global _shutdown_event
 
-    def handle_signal():
+    def handle_signal() -> None:
         """Signal handler that sets the shutdown event."""
-        print("\n\nInterrupted! Cleaning up...")
+        print("\n\nInterrupted! Requesting graceful shutdown...")
         if _shutdown_event is not None:
             _shutdown_event.set()
 
@@ -40,42 +57,120 @@ def _setup_signal_handlers():
         loop.add_signal_handler(signal.SIGINT, handle_signal)
         loop.add_signal_handler(signal.SIGTERM, handle_signal)
     except (RuntimeError, NotImplementedError):
-        # Fallback for platforms that don't support loop.add_signal_handler (Windows)
-        # This is less ideal but still functional
-        pass
+        # Windows doesn't support loop.add_signal_handler
+        # We handle KeyboardInterrupt in run_async_with_shutdown instead
+        logger.debug("Signal handlers not supported on this platform")
 
 
-async def run_with_graceful_shutdown(coro):
-    """Run a coroutine with proper graceful shutdown handling.
+async def _cleanup_resources() -> None:
+    """Clean up database and client resources.
 
-    Sets up signal handlers and ensures cleanup happens properly.
+    Uses asyncio.shield for the final commit to ensure data is saved
+    even during cancellation.
+    """
+    global _current_db, _current_client
+
+    # Disconnect client first (network resource)
+    if _current_client is not None:
+        try:
+            if _current_client.is_connected():
+                await _current_client.disconnect()
+                print("Client disconnected.")
+        except Exception as e:
+            logger.debug(f"Error disconnecting client: {e}")
+        finally:
+            _current_client = None
+
+    # Commit and close database (critical - use shield)
+    if _current_db is not None:
+        try:
+            # Shield the final commit so it completes even during cancellation
+            await asyncio.shield(asyncio.to_thread(_current_db.commit))
+            _current_db.close()
+            print("Database saved and closed.")
+        except asyncio.CancelledError:
+            # Re-try commit synchronously if shield was bypassed
+            try:
+                _current_db.commit()
+                _current_db.close()
+                print("Database saved and closed (sync fallback).")
+            except Exception as e:
+                logger.error(f"Failed to save database: {e}")
+            raise
+        except Exception as e:
+            logger.debug(f"Error closing database: {e}")
+        finally:
+            _current_db = None
+
+
+async def run_with_graceful_shutdown(
+    coro: Coroutine[Any, Any, int],
+) -> int:
+    """Run a coroutine with proper two-phase graceful shutdown.
+
+    Phase 1: On signal, set shutdown_event and let the task check it
+    Phase 2: If task doesn't exit within timeout, cancel it
+
+    The shutdown_event is passed to sync_peer so it can break loops cleanly.
+
+    Args:
+        coro: Coroutine to run (should return int exit code)
+
+    Returns:
+        Exit code from the coroutine, or 130 if interrupted
     """
     global _shutdown_event
     _shutdown_event = asyncio.Event()
     _setup_signal_handlers()
 
+    # Create task for main work
+    main_task = asyncio.create_task(coro)
+
     try:
-        return await coro
+        # Wait for either: task completion OR shutdown signal
+        shutdown_waiter = asyncio.create_task(_shutdown_event.wait())
+
+        done, pending = await asyncio.wait(
+            [main_task, shutdown_waiter],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        # If shutdown was signaled (not task completion)
+        if shutdown_waiter in done and main_task in pending:
+            print("Shutdown requested, waiting for task to finish...")
+
+            # Give the task time to finish gracefully
+            try:
+                result = await asyncio.wait_for(main_task, timeout=SHUTDOWN_TIMEOUT)
+                return result
+            except asyncio.TimeoutError:
+                print(f"Task did not finish within {SHUTDOWN_TIMEOUT}s, cancelling...")
+                main_task.cancel()
+                try:
+                    await main_task
+                except asyncio.CancelledError:
+                    pass
+                return 130  # Standard exit code for SIGINT
+
+        # Clean up the shutdown waiter if task finished first
+        if shutdown_waiter in pending:
+            shutdown_waiter.cancel()
+            try:
+                await shutdown_waiter
+            except asyncio.CancelledError:
+                pass
+
+        # Task completed normally
+        if main_task in done:
+            return main_task.result()
+
+        return 0
+
     except asyncio.CancelledError:
         print("Operation cancelled.")
-        raise
+        return 130
     finally:
-        # Proper async cleanup
-        if _current_client is not None:
-            try:
-                if _current_client.is_connected():
-                    await _current_client.disconnect()
-                    print("Client disconnected.")
-            except Exception as e:
-                logger.debug(f"Error disconnecting client: {e}")
-
-        if _current_db is not None:
-            try:
-                _current_db.commit()
-                _current_db.close()
-                print("Database saved and closed.")
-            except Exception as e:
-                logger.debug(f"Error closing database: {e}")
+        await _cleanup_resources()
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -186,13 +281,20 @@ def create_parser() -> argparse.ArgumentParser:
         "--start",
         type=str,
         default=None,
-        help="Start date (YYYY-MM-DD or YYYY-MM-DD HH:MM:SS, local timezone)",
+        help="Start date (YYYY-MM-DD or YYYY-MM-DD HH:MM:SS)",
     )
     export_parser.add_argument(
         "--end",
         type=str,
         default=None,
-        help="End date (YYYY-MM-DD or YYYY-MM-DD HH:MM:SS, local timezone)",
+        help="End date (YYYY-MM-DD or YYYY-MM-DD HH:MM:SS)",
+    )
+    export_parser.add_argument(
+        "--tz",
+        type=str,
+        default=None,
+        help="Timezone for date parsing (e.g., 'America/New_York', 'UTC'). "
+             "Defaults to system local timezone.",
     )
     export_parser.add_argument(
         "--since-id",
@@ -246,14 +348,36 @@ def setup_logging(verbose: bool = False, quiet: bool = False) -> None:
         level = logging.ERROR
         fmt = "%(message)s"
     else:
+        # User-friendly format: just the message for INFO, level prefix for warnings
         level = logging.INFO
-        fmt = "%(levelname)s: %(message)s"
+        fmt = "%(message)s"
 
     logging.basicConfig(level=level, format=fmt, force=True)
 
     # Suppress noisy third-party loggers in non-verbose mode
     if not verbose:
         logging.getLogger("telethon").setLevel(logging.WARNING)
+
+
+def run_async_with_shutdown(coro: Coroutine[Any, Any, int]) -> int:
+    """Run async coroutine with graceful shutdown, handling Windows compatibility.
+
+    This wrapper handles KeyboardInterrupt for Windows where loop.add_signal_handler
+    is not supported. On all platforms, it ensures proper cleanup.
+
+    Args:
+        coro: Coroutine to run
+
+    Returns:
+        Exit code
+    """
+    try:
+        return asyncio.run(run_with_graceful_shutdown(coro))
+    except KeyboardInterrupt:
+        # Windows fallback: KeyboardInterrupt is raised instead of signal handler
+        print("\n\nInterrupted! Cleaning up...")
+        # The cleanup already happened in run_with_graceful_shutdown's finally block
+        return 130
 
 
 def main() -> int:
@@ -270,55 +394,96 @@ def main() -> int:
         quiet=getattr(args, 'quiet', False)
     )
 
-    # Note: Signal handling is now done in async context via run_with_graceful_shutdown
-
     if args.command is None:
         parser.print_help()
         return 1
 
-    if args.command == "auth-test":
-        return asyncio.run(auth_test(use_phone=args.phone))
+    try:
+        # Commands that don't need graceful shutdown
+        if args.command == "auth-test":
+            try:
+                return asyncio.run(auth_test(use_phone=args.phone))
+            except KeyboardInterrupt:
+                print("\n\nInterrupted!")
+                return 130
 
-    if args.command == "dialogs":
-        return asyncio.run(list_dialogs(search=args.search, limit=args.limit))
+        if args.command == "dialogs":
+            try:
+                return asyncio.run(list_dialogs(search=args.search, limit=args.limit))
+            except KeyboardInterrupt:
+                print("\n\nInterrupted!")
+                return 130
 
-    if args.command == "fetch-test":
-        return asyncio.run(fetch_test(peer_input=args.peer, limit=args.limit))
+        if args.command == "fetch-test":
+            try:
+                return asyncio.run(fetch_test(peer_input=args.peer, limit=args.limit))
+            except KeyboardInterrupt:
+                print("\n\nInterrupted!")
+                return 130
 
-    if args.command == "sync":
-        return asyncio.run(run_with_graceful_shutdown(
-            run_sync(peer_input=args.peer, target_count=args.last)
-        ))
+        # Commands that need graceful shutdown (database operations)
+        if args.command == "sync":
+            return run_async_with_shutdown(
+                run_sync(peer_input=args.peer, target_count=args.last)
+            )
 
-    if args.command == "export":
-        return asyncio.run(run_with_graceful_shutdown(run_export(
-            peer_input=args.peer,
-            last_n=args.last,
-            start_date=args.start,
-            end_date=args.end,
-            since_id=args.since_id,
-            until_id=args.until_id,
-            txt_path=args.txt,
-            jsonl_path=args.jsonl,
-            include_raw=args.include_raw,
-            raw_as_string=args.raw_as_string,
-        )))
+        if args.command == "export":
+            return run_async_with_shutdown(run_export(
+                peer_input=args.peer,
+                last_n=args.last,
+                start_date=args.start,
+                end_date=args.end,
+                since_id=args.since_id,
+                until_id=args.until_id,
+                txt_path=args.txt,
+                jsonl_path=args.jsonl,
+                include_raw=args.include_raw,
+                raw_as_string=args.raw_as_string,
+                tz_name=args.tz,
+            ))
+
+    except ConfigurationError as e:
+        print(f"Error: {e}")
+        return 1
 
     return 0
 
 
-def parse_local_datetime(date_str: str | None, is_end: bool = False) -> datetime | None:
-    """Parse a local datetime string to UTC.
+def parse_local_datetime(
+    date_str: str | None,
+    is_end: bool = False,
+    tz_name: str | None = None,
+) -> datetime | None:
+    """Parse a datetime string to UTC.
 
     Args:
         date_str: Date string (YYYY-MM-DD or YYYY-MM-DD HH:MM:SS)
         is_end: If True and date-only format, set time to end of day (23:59:59.999999)
+        tz_name: Explicit timezone name (e.g., 'America/New_York', 'UTC').
+                 If None, uses system local timezone.
 
     Returns:
         UTC datetime or None
+
+    Raises:
+        ValueError: If date_str cannot be parsed or tz_name is invalid
     """
     if not date_str:
         return None
+
+    # Get the timezone to use
+    if tz_name is not None:
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(tz_name)
+        except (ImportError, KeyError) as e:
+            raise ValueError(
+                f"Invalid timezone: {tz_name}. "
+                "Use IANA timezone names like 'America/New_York' or 'UTC'."
+            ) from e
+    else:
+        # Use system local timezone
+        tz = None
 
     # Try parsing with time
     for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"]:
@@ -327,9 +492,16 @@ def parse_local_datetime(date_str: str | None, is_end: bool = False) -> datetime
             # For date-only format with is_end=True, set to end of day
             if fmt == "%Y-%m-%d" and is_end:
                 dt = dt.replace(hour=23, minute=59, second=59, microsecond=999999)
-            # Assume local timezone, convert to UTC
-            local_dt = dt.astimezone()  # Add local TZ info
-            utc_dt = local_dt.astimezone(timezone.utc)
+
+            if tz is not None:
+                # Use explicit timezone
+                dt = dt.replace(tzinfo=tz)
+            else:
+                # Use local timezone (astimezone on naive datetime adds local TZ)
+                dt = dt.astimezone()
+
+            # Convert to UTC
+            utc_dt = dt.astimezone(timezone.utc)
             return utc_dt
         except ValueError:
             continue
@@ -348,29 +520,30 @@ async def run_export(
     jsonl_path: str | None,
     include_raw: bool,
     raw_as_string: bool = False,
+    tz_name: str | None = None,
 ) -> int:
     """Run export command (sync first, then export).
 
     Returns:
         Exit code
     """
-    global _current_db, _current_client
+    global _current_db, _current_client, _shutdown_event
 
     if not txt_path and not jsonl_path:
-        print("Error: At least one output format required (--txt or --jsonl)")
+        logger.error("At least one output format required (--txt or --jsonl)")
         return 1
 
     # Validate mutual exclusivity of --last with date/ID filters
     if last_n is not None and any([start_date, end_date, since_id, until_id]):
-        print("Error: --last cannot be combined with date/ID filters (--start, --end, --since-id, --until-id)")
+        logger.error("--last cannot be combined with date/ID filters (--start, --end, --since-id, --until-id)")
         return 1
 
     # Parse dates (end date uses end-of-day semantics for date-only input)
     try:
-        start_dt = parse_local_datetime(start_date, is_end=False)
-        end_dt = parse_local_datetime(end_date, is_end=True)
+        start_dt = parse_local_datetime(start_date, is_end=False, tz_name=tz_name)
+        end_dt = parse_local_datetime(end_date, is_end=True, tz_name=tz_name)
     except ValueError as e:
-        print(f"Error: {e}")
+        logger.error(f"{e}")
         return 1
 
     # Determine target count for sync
@@ -393,25 +566,30 @@ async def run_export(
     try:
         await ensure_authorized(client)
 
+        # Check for early shutdown
+        if _shutdown_event and _shutdown_event.is_set():
+            logger.info("Shutdown requested before sync started")
+            return 130
+
         # Normalize peer input (handle t.me links, etc.)
         normalized_peer = normalize_peer_input(peer_input)
 
         # Step 1: Resolve peer to get peer_id
-        print(f"Resolving peer: {peer_input}...")
+        logger.info(f"Resolving peer: {peer_input}...")
         try:
             input_entity = await client.get_input_entity(normalized_peer)
             entity = await client.get_entity(input_entity)
         except ValueError:
-            print(f"Error: Could not find entity '{peer_input}'")
+            logger.error(f"Could not find entity '{peer_input}'")
             return 1
 
         peer_id = get_peer_id(entity)
         title = get_display_name(entity)
-        print(f"Resolved: {title} (peer_id: {peer_id})")
+        logger.info(f"Resolved: {title} (peer_id: {peer_id})")
 
         # Step 2: Sync (with boundary-aware backfill for date/ID filters)
-        # Pass resolved entity to avoid double resolution
-        print("\n--- Syncing ---")
+        # Pass resolved entity and shutdown_event for graceful interruption
+        logger.info("--- Syncing ---")
         await sync_peer(
             client=client,
             db=db,
@@ -420,11 +598,17 @@ async def run_export(
             min_id=since_id,     # Or until we have messages at this ID
             entity=entity,
             peer_id=peer_id,
+            shutdown_event=_shutdown_event,
         )
 
+        # Check for shutdown before export
+        if _shutdown_event and _shutdown_event.is_set():
+            logger.info("Shutdown requested, skipping export")
+            return 130
+
         # Step 3: Export from DB
-        print("\n--- Exporting ---")
-        export_messages(
+        logger.info("--- Exporting ---")
+        results = export_messages(
             db=db,
             peer_id=peer_id,
             txt_path=txt_path,
@@ -438,11 +622,18 @@ async def run_export(
             raw_as_string=raw_as_string,
         )
 
-        print("\nExport complete!")
+        # Report results
+        for fmt, count in results.items():
+            logger.info(f"Exported {count} messages to {fmt.upper()}")
+
+        logger.info("Export complete!")
         return 0
 
+    except asyncio.CancelledError:
+        # Re-raise to let the shutdown handler deal with it
+        raise
     except ValueError as e:
-        print(f"Error: {e}")
+        logger.error(f"{e}")
         return 1
     # Note: Cleanup is handled by run_with_graceful_shutdown
 
@@ -457,7 +648,7 @@ async def run_sync(peer_input: str, target_count: int) -> int:
     Returns:
         Exit code
     """
-    global _current_db, _current_client
+    global _current_db, _current_client, _shutdown_event
 
     client = create_client()
     db = Database()
@@ -467,6 +658,11 @@ async def run_sync(peer_input: str, target_count: int) -> int:
     try:
         await ensure_authorized(client)
 
+        # Check for early shutdown
+        if _shutdown_event and _shutdown_event.is_set():
+            logger.info("Shutdown requested before sync started")
+            return 130
+
         # Normalize peer input (handle t.me links, etc.)
         normalized_peer = normalize_peer_input(peer_input)
 
@@ -475,11 +671,15 @@ async def run_sync(peer_input: str, target_count: int) -> int:
             db=db,
             peer_input=normalized_peer,
             target_count=target_count,
+            shutdown_event=_shutdown_event,
         )
 
         return 0
+    except asyncio.CancelledError:
+        # Re-raise to let the shutdown handler deal with it
+        raise
     except ValueError as e:
-        print(f"Error: {e}")
+        logger.error(f"{e}")
         return 1
     # Note: Cleanup is handled by run_with_graceful_shutdown
 

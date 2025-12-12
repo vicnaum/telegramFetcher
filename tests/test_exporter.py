@@ -2,31 +2,30 @@
 
 Focus on:
 - raw_data exported as JSON object (not double-encoded string)
-- Reply sender lookup efficiency
+- Export output format validation
+- Filter parameter validation
 """
 
 import json
 import tempfile
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
 from tgx.db import Database
 from tgx.exporter import (
-    build_sender_lookup_for_replies,
-    collect_reply_ids,
     export_jsonl,
+    export_txt,
     format_jsonl_line,
 )
 
 
 @pytest.fixture
-def db():
+def db(tmp_path):
     """Create a temporary database for testing."""
-    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
-        db_path = f.name
-
-    database = Database(db_path)
+    db_path = tmp_path / "test.sqlite"
+    database = Database(str(db_path))
     yield database
     database.close()
 
@@ -161,79 +160,10 @@ class TestRawDataExport:
         assert isinstance(output["date_utc_ms"], int)
 
 
-class TestReplySenderLookup:
-    """Test optimized reply sender lookup."""
-
-    def test_collect_reply_ids(self, db):
-        """Should collect only non-null reply IDs."""
-        db.update_peer(123, "test", "Test Peer", "channel")
-        db.commit()
-
-        # Insert messages with various reply states
-        for i, reply_to in enumerate([None, 100, None, 200, 100]):  # 100 appears twice
-            db.insert_message(
-                msg_id=i + 1,
-                peer_id=123,
-                date=datetime.now(timezone.utc),
-                sender_id=456,
-                sender_name="Alice",
-                text=f"Message {i}",
-                reply_to_msg_id=reply_to,
-                has_media=False,
-                media_type=None,
-                raw_data="{}",
-            )
-        db.commit()
-
-        rows = list(db.get_messages(123))
-        reply_ids = collect_reply_ids(rows)
-
-        # Should be a set with unique non-null values
-        assert reply_ids == {100, 200}
-
-    def test_build_sender_lookup_targeted(self, db):
-        """Lookup should only query specified message IDs."""
-        db.update_peer(123, "test", "Test Peer", "channel")
-        db.commit()
-
-        # Insert 10 messages
-        for i in range(10):
-            db.insert_message(
-                msg_id=i,
-                peer_id=123,
-                date=datetime.now(timezone.utc),
-                sender_id=456 + i,
-                sender_name=f"User{i}",
-                text=f"Message {i}",
-                reply_to_msg_id=None,
-                has_media=False,
-                media_type=None,
-                raw_data="{}",
-            )
-        db.commit()
-
-        # Build lookup for only specific IDs
-        lookup = build_sender_lookup_for_replies(db, 123, {2, 5, 8})
-
-        # Should only have entries for requested IDs
-        assert set(lookup.keys()) == {2, 5, 8}
-        assert lookup[2] == "User2"
-        assert lookup[5] == "User5"
-        assert lookup[8] == "User8"
-
-    def test_build_sender_lookup_empty(self, db):
-        """Empty reply set should return empty lookup."""
-        db.update_peer(123, "test", "Test Peer", "channel")
-        db.commit()
-
-        lookup = build_sender_lookup_for_replies(db, 123, set())
-        assert lookup == {}
-
-
 class TestExportJsonl:
     """Test JSONL export function."""
 
-    def test_export_creates_valid_jsonl(self, db):
+    def test_export_creates_valid_jsonl(self, db, tmp_path):
         """Export should create valid JSONL file."""
         db.update_peer(123, "test", "Test Peer", "channel")
         db.commit()
@@ -253,9 +183,7 @@ class TestExportJsonl:
             )
         db.commit()
 
-        with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as f:
-            output_path = f.name
-
+        output_path = tmp_path / "export.jsonl"
         count = export_jsonl(db, 123, output_path, include_raw=True)
         assert count == 5
 
@@ -270,3 +198,153 @@ class TestExportJsonl:
             assert "raw_data" in obj
             assert isinstance(obj["raw_data"], dict)  # Parsed, not string
 
+
+class TestExportTxt:
+    """Test TXT export function."""
+
+    def test_export_creates_valid_txt(self, db, tmp_path):
+        """Export should create valid TXT file."""
+        db.update_peer(123, "test", "Test Peer", "channel")
+        db.commit()
+
+        for i in range(5):
+            db.insert_message(
+                msg_id=i,
+                peer_id=123,
+                date=datetime.now(timezone.utc),
+                sender_id=456,
+                sender_name="Alice",
+                text=f"Message {i}",
+                reply_to_msg_id=None,
+                has_media=False,
+                media_type=None,
+                raw_data="{}",
+            )
+        db.commit()
+
+        output_path = tmp_path / "export.txt"
+        count = export_txt(db, 123, output_path)
+        assert count == 5
+
+        # Verify file format
+        with open(output_path) as f:
+            lines = f.readlines()
+
+        assert len(lines) == 5
+        for i, line in enumerate(lines):
+            # Each line should have format: [msg_id] timestamp | sender | text
+            assert f"[{i}]" in line
+            assert "Alice" in line
+            assert f"Message {i}" in line
+
+    def test_export_with_replies(self, db, tmp_path):
+        """Export should include reply sender names."""
+        db.update_peer(123, "test", "Test Peer", "channel")
+        db.commit()
+
+        # Original message
+        db.insert_message(
+            msg_id=1,
+            peer_id=123,
+            date=datetime.now(timezone.utc),
+            sender_id=456,
+            sender_name="Alice",
+            text="Original message",
+            reply_to_msg_id=None,
+            has_media=False,
+            media_type=None,
+            raw_data="{}",
+        )
+        # Reply to the original
+        db.insert_message(
+            msg_id=2,
+            peer_id=123,
+            date=datetime.now(timezone.utc),
+            sender_id=789,
+            sender_name="Bob",
+            text="Reply message",
+            reply_to_msg_id=1,
+            has_media=False,
+            media_type=None,
+            raw_data="{}",
+        )
+        db.commit()
+
+        output_path = tmp_path / "export.txt"
+        count = export_txt(db, 123, output_path)
+        assert count == 2
+
+        with open(output_path) as f:
+            lines = f.readlines()
+
+        # Second line should have reply info with sender name
+        assert "[reply to #1 @Alice]" in lines[1]
+
+
+class TestExportFilterValidation:
+    """Test that export functions validate filter parameters."""
+
+    def test_last_n_with_other_filters_raises(self, db, tmp_path):
+        """Using last_n with other filters should raise ValueError."""
+        db.update_peer(123, "test", "Test Peer", "channel")
+        db.commit()
+
+        output_path = tmp_path / "export.jsonl"
+
+        with pytest.raises(ValueError, match="last_n cannot be combined"):
+            export_jsonl(db, 123, output_path, last_n=10, since_id=5)
+
+        with pytest.raises(ValueError, match="last_n cannot be combined"):
+            export_jsonl(
+                db, 123, output_path,
+                last_n=10,
+                start_date=datetime.now(timezone.utc)
+            )
+
+    def test_last_n_alone_works(self, db, tmp_path):
+        """Using last_n alone should work."""
+        db.update_peer(123, "test", "Test Peer", "channel")
+        db.commit()
+
+        for i in range(10):
+            db.insert_message(
+                msg_id=i,
+                peer_id=123,
+                date=datetime.now(timezone.utc),
+                sender_id=456,
+                sender_name="Alice",
+                text=f"Message {i}",
+                reply_to_msg_id=None,
+                has_media=False,
+                media_type=None,
+                raw_data="{}",
+            )
+        db.commit()
+
+        output_path = tmp_path / "export.jsonl"
+        count = export_jsonl(db, 123, output_path, last_n=5)
+        assert count == 5
+
+    def test_other_filters_work(self, db, tmp_path):
+        """Using filters without last_n should work."""
+        db.update_peer(123, "test", "Test Peer", "channel")
+        db.commit()
+
+        for i in range(10):
+            db.insert_message(
+                msg_id=i,
+                peer_id=123,
+                date=datetime.now(timezone.utc),
+                sender_id=456,
+                sender_name="Alice",
+                text=f"Message {i}",
+                reply_to_msg_id=None,
+                has_media=False,
+                media_type=None,
+                raw_data="{}",
+            )
+        db.commit()
+
+        output_path = tmp_path / "export.jsonl"
+        count = export_jsonl(db, 123, output_path, since_id=5)
+        assert count == 4  # Messages 6, 7, 8, 9

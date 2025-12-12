@@ -1,36 +1,72 @@
 """Utility functions for tgx."""
 
 import re
+from urllib.parse import urlparse
 
 from telethon import utils as tl_utils
 
 
 def normalize_peer_input(peer_input: str) -> str | int:
-    """Normalize peer input to username or int ID.
+    """Normalize peer input to username, int ID, or passthrough for special links.
 
     Handles various input formats:
     - https://t.me/username -> @username
+    - https://t.me/username/123 -> @username (message link)
     - t.me/username -> @username
     - @username -> @username (unchanged)
     - username -> @username
     - -1001234567890 -> -1001234567890 (int)
     - 1234567890 -> 1234567890 (int)
 
+    Special cases (passed through to Telethon):
+    - t.me/c/123456789/123 -> passthrough (private channel link with numeric ID)
+    - t.me/+abcdef -> passthrough (invite link)
+    - t.me/joinchat/abcdef -> passthrough (invite link)
+
     Args:
         peer_input: Raw peer identifier from user
 
     Returns:
-        Normalized username (str with @) or peer ID (int)
+        Normalized username (str with @), peer ID (int), or original string for
+        special links that Telethon should handle directly
     """
     peer_input = peer_input.strip()
 
     # Handle t.me links (various formats)
-    if "t.me/" in peer_input:
-        # Match: t.me/username, t.me/+invite, t.me/joinchat/hash
-        match = re.search(r't\.me/(?:\+|joinchat/)?([a-zA-Z][\w]+)', peer_input)
-        if match:
-            return f"@{match.group(1)}"
-        # If we can't parse it, return as-is and let Telethon try
+    if "t.me/" in peer_input or "telegram.me/" in peer_input:
+        # Parse URL properly
+        url = peer_input
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+
+        parsed = urlparse(url)
+        path = parsed.path.strip("/")
+
+        if not path:
+            # Just "t.me" with no path
+            return peer_input
+
+        # Split path into segments
+        segments = path.split("/")
+        first_segment = segments[0]
+
+        # Invite links: t.me/+xxx or t.me/joinchat/xxx
+        # Pass these through to Telethon to handle
+        if first_segment.startswith("+") or first_segment == "joinchat":
+            return peer_input
+
+        # Private channel links: t.me/c/123456789/123
+        # The "c" indicates a private channel with numeric ID
+        if first_segment == "c":
+            # Return the original - Telethon can resolve these
+            return peer_input
+
+        # Public username links: t.me/username or t.me/username/123
+        # Validate that it looks like a username (starts with letter, alphanumeric + underscore)
+        if re.match(r"^[a-zA-Z][a-zA-Z0-9_]{3,}$", first_segment):
+            return f"@{first_segment}"
+
+        # Unknown format, pass through
         return peer_input
 
     # Already has @ prefix
@@ -59,7 +95,8 @@ def get_display_name(entity) -> str:
     if entity is None:
         return "Unknown"
 
-    return tl_utils.get_display_name(entity)
+    result: str = tl_utils.get_display_name(entity)
+    return result
 
 
 def get_peer_id(entity) -> int:
@@ -71,7 +108,8 @@ def get_peer_id(entity) -> int:
     Returns:
         Integer peer ID (negative for chats/channels)
     """
-    return tl_utils.get_peer_id(entity)
+    result: int = tl_utils.get_peer_id(entity)
+    return result
 
 
 def truncate_text(text: str | None, max_len: int = 50) -> str:

@@ -2,7 +2,6 @@
 
 import logging
 import os
-import sys
 from getpass import getpass
 from io import StringIO
 from pathlib import Path
@@ -14,6 +13,12 @@ from telethon.errors import SessionPasswordNeededError
 from tgx.utils import get_display_name, get_peer_id, normalize_peer_input, truncate_text
 
 logger = logging.getLogger(__name__)
+
+
+class ConfigurationError(Exception):
+    """Raised when required configuration is missing or invalid."""
+
+    pass
 
 
 def get_session_path() -> str:
@@ -32,17 +37,25 @@ def get_api_credentials() -> tuple[int, str]:
         Tuple of (api_id, api_hash)
 
     Raises:
-        SystemExit: If credentials are not set
+        ConfigurationError: If credentials are not set or api_id is not numeric
     """
-    api_id = os.environ.get("TGX_API_ID")
+    api_id_str = os.environ.get("TGX_API_ID")
     api_hash = os.environ.get("TGX_API_HASH")
 
-    if not api_id or not api_hash:
-        print("Error: TGX_API_ID and TGX_API_HASH environment variables must be set.")
-        print("Get them from https://my.telegram.org/apps")
-        sys.exit(1)
+    if not api_id_str or not api_hash:
+        raise ConfigurationError(
+            "TGX_API_ID and TGX_API_HASH environment variables must be set. "
+            "Get them from https://my.telegram.org/apps"
+        )
 
-    return int(api_id), api_hash
+    try:
+        api_id = int(api_id_str)
+    except ValueError as e:
+        raise ConfigurationError(
+            f"TGX_API_ID must be a numeric value, got: {api_id_str!r}"
+        ) from e
+
+    return api_id, api_hash
 
 
 def create_client(session_path: str | None = None, receive_updates: bool = True) -> TelegramClient:
@@ -195,7 +208,7 @@ async def phone_login(client: TelegramClient) -> bool:
     Returns:
         True if successful, False otherwise
     """
-    from telethon.errors import FloodWaitError, PhoneNumberInvalidError, PhoneCodeInvalidError
+    from telethon.errors import FloodWaitError, PhoneCodeInvalidError, PhoneNumberInvalidError
 
     print("\n📞 Phone Login")
     print("=" * 40)
