@@ -328,12 +328,12 @@ async def auth_test(use_phone: bool = False) -> int:
         await client.disconnect()
 
 
-async def list_dialogs(search: str | None = None, limit: int = 20) -> int:
+async def list_dialogs(search: str | None = None, limit: int | None = 20) -> int:
     """List dialogs (chats/channels) with optional search filter.
 
     Args:
         search: Optional search text to filter dialogs
-        limit: Maximum number of dialogs to show
+        limit: Maximum number of dialogs to show (None = unlimited)
 
     Returns:
         Exit code (0 for success)
@@ -344,10 +344,19 @@ async def list_dialogs(search: str | None = None, limit: int = 20) -> int:
         await ensure_authorized(client)
 
         search_msg = f' matching "{search}"' if search else ''
-        print(f"Listing dialogs{search_msg}...\n")
+        limit_msg = "" if limit is None else f" (limit: {limit})"
+        print(f"Listing dialogs{search_msg}{limit_msg}...\n")
 
         count = 0
-        async for dialog in client.iter_dialogs():
+        displayed = 0
+
+        # If searching, we need to fetch more since we filter client-side
+        # If not searching and limit is set, we can limit the API call
+        fetch_limit = None if search else limit
+
+        async for dialog in client.iter_dialogs(limit=fetch_limit):
+            count += 1
+
             # Filter by search if provided
             title = dialog.title or ""
             username = getattr(dialog.entity, "username", None) or ""
@@ -366,13 +375,15 @@ async def list_dialogs(search: str | None = None, limit: int = 20) -> int:
             print(f"    username: {username_str}")
             print()
 
-            count += 1
-            if count >= limit:
-                print(f"(showing first {limit} results)")
+            displayed += 1
+            if limit is not None and displayed >= limit:
+                print(f"(showing first {limit} results, use --all to see all)")
                 break
 
-        if count == 0:
+        if displayed == 0:
             print("No dialogs found.")
+        else:
+            print(f"Total: {displayed} dialogs shown")
 
         return 0
     finally:

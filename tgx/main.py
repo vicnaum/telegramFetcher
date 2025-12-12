@@ -256,7 +256,13 @@ def create_parser() -> argparse.ArgumentParser:
         "--limit",
         type=int,
         default=20,
-        help="Maximum number of dialogs to show (default: 20)",
+        help="Maximum number of dialogs to show (default: 20, use --all for unlimited)",
+    )
+    dialogs_parser.add_argument(
+        "--all",
+        action="store_true",
+        dest="show_all",
+        help="Show all dialogs (may be slow for accounts with many chats)",
     )
 
     # fetch-test command
@@ -466,7 +472,8 @@ def main() -> int:
 
         if args.command == "dialogs":
             try:
-                return asyncio.run(list_dialogs(search=args.search, limit=args.limit))
+                limit = None if args.show_all else args.limit
+                return asyncio.run(list_dialogs(search=args.search, limit=limit))
             except KeyboardInterrupt:
                 logger.warning("\nInterrupted!")
                 return 130
