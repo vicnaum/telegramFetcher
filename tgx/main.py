@@ -518,6 +518,188 @@ def parse_local_datetime(
     raise ValueError(f"Could not parse date: {date_str}. Use YYYY-MM-DD or YYYY-MM-DD HH:MM:SS")
 
 
+async def _sync_date_range_with_gaps(
+    client,
+    db: Database,
+    entity,
+    peer_id: int,
+    start_dt: datetime,
+    end_dt: datetime,
+    shutdown_event: asyncio.Event | None,
+    store_raw: bool,
+) -> None:
+    """Sync a specific date range, fetching ONLY what's needed.
+
+    This is the gap-aware sync strategy:
+    1. Check existing coverage for the requested date range
+    2. Identify gaps (parts of the range we don't have)
+    3. Fetch ONLY the gaps - NOT everything from now to start
+
+    This allows fetching an old date range without fetching all
+    intermediate messages.
+
+    Args:
+        client: Authenticated TelegramClient
+        db: Database instance
+        entity: Resolved Telethon entity
+        peer_id: Peer ID
+        start_dt: Start of date range (UTC)
+        end_dt: End of date range (UTC)
+        shutdown_event: Optional shutdown event
+        store_raw: Whether to store raw JSON
+    """
+
+    def _should_shutdown() -> bool:
+        return shutdown_event is not None and shutdown_event.is_set()
+
+    # Check what we already have for this date range
+    gaps = db.find_gaps_in_date_range(peer_id, start_dt, end_dt)
+
+    if not gaps:
+        logger.info("Date range fully covered, no sync needed")
+        return
+
+    # Report what we need to fetch
+    if len(gaps) == 1 and gaps[0][0] == start_dt and gaps[0][1] == end_dt:
+        # Entire range is missing
+        logger.info(f"Fetching: {start_dt.strftime('%Y-%m-%d %H:%M')} → {end_dt.strftime('%Y-%m-%d %H:%M')}")
+    else:
+        logger.info(f"Found {len(gaps)} gap(s) to fill:")
+        for gap_start, gap_end, approx_start_id, approx_end_id in gaps:
+            gap_start_str = gap_start.strftime("%Y-%m-%d %H:%M")
+            gap_end_str = gap_end.strftime("%Y-%m-%d %H:%M")
+            logger.info(f"  {gap_start_str} → {gap_end_str}")
+
+    # Fetch each gap (or the whole range if no prior coverage)
+    for i, (gap_start, gap_end, approx_start_id, approx_end_id) in enumerate(gaps, 1):
+        if _should_shutdown():
+            logger.info("Shutdown requested, stopping sync")
+            return
+
+        if len(gaps) > 1:
+            logger.info(f"Fetching gap {i}/{len(gaps)}...")
+
+        # Fetch ONLY this date range using offset_date
+        await _fetch_date_range(
+            client=client,
+            db=db,
+            entity=entity,
+            peer_id=peer_id,
+            start_date=gap_start,
+            end_date=gap_end,
+            shutdown_event=shutdown_event,
+            store_raw=store_raw,
+        )
+
+    if len(gaps) > 1:
+        logger.info("All gaps filled!")
+
+
+async def _fetch_date_range(
+    client,
+    db: Database,
+    entity,
+    peer_id: int,
+    start_date: datetime,
+    end_date: datetime,
+    shutdown_event: asyncio.Event | None,
+    store_raw: bool,
+    batch_size: int = 100,
+) -> int:
+    """Fetch messages within a specific date range.
+
+    Uses offset_date to start from end_date and works backwards until start_date.
+
+    Args:
+        client: TelegramClient
+        db: Database
+        entity: Telethon entity
+        peer_id: Peer ID
+        start_date: Start of range (UTC)
+        end_date: End of range (UTC)
+        shutdown_event: Shutdown event
+        store_raw: Whether to store raw JSON
+        batch_size: Commit batch size
+
+    Returns:
+        Number of messages fetched
+    """
+    from tgx.db import datetime_to_epoch_ms
+    from tgx.sync import (
+        _flush_batch,
+        classify_peer_type,
+        message_to_dict,
+    )
+
+    def _should_shutdown() -> bool:
+        return shutdown_event is not None and shutdown_event.is_set()
+
+    title = get_display_name(entity)
+    username = getattr(entity, "username", None)
+    peer_type = classify_peer_type(entity)
+
+    # Ensure peer record exists
+    db.update_peer(peer_id, username, title, peer_type)
+    db.commit()
+
+    sender_cache: dict[int, str | None] = {}
+    stats = {"total_inserted": 0}
+    batch: list[dict] = []
+    total_fetched = 0
+
+    # Fetch messages using offset_date (starts from end_date, goes backwards)
+    async for msg in client.iter_messages(
+        entity,
+        offset_date=end_date,
+        reverse=False,  # Newest first, going backwards
+        wait_time=1,
+    ):
+        # Stop if we've gone past start_date
+        if msg.date.replace(tzinfo=timezone.utc) < start_date:
+            break
+
+        if _should_shutdown():
+            break
+
+        batch.append(await message_to_dict(msg, peer_id, sender_cache, title, store_raw))
+        total_fetched += 1
+
+        if len(batch) >= batch_size:
+            _flush_batch(db, batch, stats)
+            # Show progress with current date
+            batch_dates = [m["date"] for m in batch if m["date"]]
+            if batch_dates:
+                oldest = min(batch_dates).strftime("%Y-%m-%d %H:%M")
+                newest = max(batch_dates).strftime("%Y-%m-%d %H:%M")
+                target = start_date.strftime("%Y-%m-%d %H:%M")
+                logger.info(f"  +{len(batch)} msgs [{oldest} → {newest}] → target: {target}")
+            batch = []
+
+    # Flush remaining
+    if batch:
+        _flush_batch(db, batch, stats)
+        batch_dates = [m["date"] for m in batch if m["date"]]
+        if batch_dates:
+            oldest = min(batch_dates).strftime("%Y-%m-%d %H:%M")
+            newest = max(batch_dates).strftime("%Y-%m-%d %H:%M")
+            logger.info(f"  +{len(batch)} msgs [{oldest} → {newest}]")
+
+    # Register this fetch as a sync range (if we inserted anything)
+    if stats["total_inserted"] > 0 and stats.get("session_min_id") is not None:
+        db.add_sync_range(
+            peer_id=peer_id,
+            min_msg_id=stats["session_min_id"],
+            max_msg_id=stats["session_max_id"],
+            min_date_utc_ms=stats["session_min_date_ms"],
+            max_date_utc_ms=stats["session_max_date_ms"],
+            message_count=stats["total_inserted"],
+        )
+        db.commit()
+
+    logger.info(f"Fetched: {total_fetched} msgs, {stats['total_inserted']} new")
+    return stats["total_inserted"]
+
+
 async def run_export(
     peer_input: str,
     last_n: int | None,
@@ -603,21 +785,34 @@ async def run_export(
         title = get_display_name(entity)
         logger.info(f"Resolved: {title} (peer_id: {peer_id})")
 
-        # Step 2: Sync (with boundary-aware backfill for date/ID filters)
-        # Pass resolved entity and shutdown_event for graceful interruption
-        # sync_min_date/sync_min_id derived above to handle --end/--until-id correctly
+        # Step 2: Sync - strategy depends on whether date range is specified
         logger.info("--- Syncing ---")
-        await sync_peer(
-            client=client,
-            db=db,
-            target_count=target_count,
-            min_date=sync_min_date,   # Backfill until we have messages at this date
-            min_id=sync_min_id,       # Or until we have messages at this ID
-            entity=entity,
-            peer_id=peer_id,
-            shutdown_event=_shutdown_event,
-            store_raw=store_raw,
-        )
+
+        if start_dt and end_dt:
+            # Date range mode: check coverage and fill gaps
+            await _sync_date_range_with_gaps(
+                client=client,
+                db=db,
+                entity=entity,
+                peer_id=peer_id,
+                start_dt=start_dt,
+                end_dt=end_dt,
+                shutdown_event=_shutdown_event,
+                store_raw=store_raw,
+            )
+        else:
+            # Standard mode: tail sync + backfill to boundary
+            await sync_peer(
+                client=client,
+                db=db,
+                target_count=target_count,
+                min_date=sync_min_date,   # Backfill until we have messages at this date
+                min_id=sync_min_id,       # Or until we have messages at this ID
+                entity=entity,
+                peer_id=peer_id,
+                shutdown_event=_shutdown_event,
+                store_raw=store_raw,
+            )
 
         # Check for shutdown before export
         if _shutdown_event and _shutdown_event.is_set():

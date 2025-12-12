@@ -3,6 +3,7 @@
 import os
 import sqlite3
 from collections.abc import Iterator
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -124,6 +125,25 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_msg_date ON messages(peer_id, date_utc_ms);
             CREATE INDEX IF NOT EXISTS idx_msg_peer_id ON messages(peer_id, id);
             CREATE INDEX IF NOT EXISTS idx_msg_reply ON messages(peer_id, reply_to_msg_id);
+
+            -- Tracks which ranges of messages have been synced for each peer
+            -- Allows detecting gaps and avoiding redundant fetches
+            CREATE TABLE IF NOT EXISTS sync_ranges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                peer_id INTEGER NOT NULL,
+                -- ID boundaries (precise, monotonic)
+                min_msg_id INTEGER NOT NULL,
+                max_msg_id INTEGER NOT NULL,
+                -- Date boundaries (for user-facing queries)
+                min_date_utc_ms INTEGER NOT NULL,
+                max_date_utc_ms INTEGER NOT NULL,
+                -- Metadata
+                message_count INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                FOREIGN KEY (peer_id) REFERENCES peers(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_sync_ranges_peer ON sync_ranges(peer_id, min_msg_id);
         """)
         self.conn.commit()
 
@@ -695,4 +715,313 @@ class Database:
             """
             cursor = self.conn.execute(query, params)
             yield from cursor
+
+    # -------------------------------------------------------------------------
+    # Sync Range Management
+    # -------------------------------------------------------------------------
+
+    def get_sync_ranges(self, peer_id: int) -> list["SyncRange"]:
+        """Get all sync ranges for a peer, ordered by min_msg_id.
+
+        Args:
+            peer_id: Telegram peer ID
+
+        Returns:
+            List of SyncRange objects, sorted by min_msg_id ascending
+        """
+        rows = self.conn.execute("""
+            SELECT id, peer_id, min_msg_id, max_msg_id,
+                   min_date_utc_ms, max_date_utc_ms, message_count
+            FROM sync_ranges
+            WHERE peer_id = ?
+            ORDER BY min_msg_id ASC
+        """, (peer_id,)).fetchall()
+
+        return [
+            SyncRange(
+                id=row["id"],
+                peer_id=row["peer_id"],
+                min_msg_id=row["min_msg_id"],
+                max_msg_id=row["max_msg_id"],
+                min_date_utc_ms=row["min_date_utc_ms"],
+                max_date_utc_ms=row["max_date_utc_ms"],
+                message_count=row["message_count"],
+            )
+            for row in rows
+        ]
+
+    def add_sync_range(
+        self,
+        peer_id: int,
+        min_msg_id: int,
+        max_msg_id: int,
+        min_date_utc_ms: int,
+        max_date_utc_ms: int,
+        message_count: int,
+    ) -> int:
+        """Add a new sync range and merge with overlapping/adjacent ranges.
+
+        Args:
+            peer_id: Telegram peer ID
+            min_msg_id: Minimum message ID in range
+            max_msg_id: Maximum message ID in range
+            min_date_utc_ms: Earliest message date in range (epoch ms)
+            max_date_utc_ms: Latest message date in range (epoch ms)
+            message_count: Number of messages in range
+
+        Returns:
+            ID of the inserted/merged range
+        """
+        now_ms = datetime_to_epoch_ms(datetime.now(timezone.utc))
+
+        # Insert the new range
+        cursor = self.conn.execute("""
+            INSERT INTO sync_ranges
+            (peer_id, min_msg_id, max_msg_id, min_date_utc_ms, max_date_utc_ms,
+             message_count, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            peer_id, min_msg_id, max_msg_id,
+            min_date_utc_ms, max_date_utc_ms,
+            message_count, now_ms, now_ms
+        ))
+        new_id = cursor.lastrowid
+
+        # Merge overlapping/adjacent ranges
+        self._merge_sync_ranges(peer_id)
+
+        return new_id
+
+    def _merge_sync_ranges(self, peer_id: int) -> None:
+        """Merge overlapping or adjacent sync ranges for a peer.
+
+        Ranges are considered adjacent if their IDs differ by 1 or less
+        (accounting for potential deleted messages in between).
+
+        Args:
+            peer_id: Telegram peer ID
+        """
+        ranges = self.get_sync_ranges(peer_id)
+        if len(ranges) < 2:
+            return
+
+        merged: list[SyncRange] = [ranges[0]]
+
+        for r in ranges[1:]:
+            last = merged[-1]
+            # Adjacent or overlapping? (IDs within 1 means adjacent)
+            # We use a small tolerance (10) to account for deleted messages
+            if r.min_msg_id <= last.max_msg_id + 10:
+                # Merge: combine into one range
+                merged[-1] = SyncRange(
+                    id=last.id,  # Keep the first range's ID
+                    peer_id=peer_id,
+                    min_msg_id=min(last.min_msg_id, r.min_msg_id),
+                    max_msg_id=max(last.max_msg_id, r.max_msg_id),
+                    min_date_utc_ms=min(last.min_date_utc_ms, r.min_date_utc_ms),
+                    max_date_utc_ms=max(last.max_date_utc_ms, r.max_date_utc_ms),
+                    message_count=last.message_count + r.message_count,
+                )
+            else:
+                # Gap detected, keep as separate range
+                merged.append(r)
+
+        # If we merged anything, update the database
+        if len(merged) < len(ranges):
+            now_ms = datetime_to_epoch_ms(datetime.now(timezone.utc))
+
+            # Delete all existing ranges for this peer
+            self.conn.execute(
+                "DELETE FROM sync_ranges WHERE peer_id = ?",
+                (peer_id,)
+            )
+
+            # Re-insert the merged ranges
+            for r in merged:
+                self.conn.execute("""
+                    INSERT INTO sync_ranges
+                    (peer_id, min_msg_id, max_msg_id, min_date_utc_ms, max_date_utc_ms,
+                     message_count, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    peer_id, r.min_msg_id, r.max_msg_id,
+                    r.min_date_utc_ms, r.max_date_utc_ms,
+                    r.message_count, now_ms, now_ms
+                ))
+
+    def find_gaps_in_ranges(
+        self,
+        peer_id: int,
+        target_min_id: int | None = None,
+        target_max_id: int | None = None,
+    ) -> list[tuple[int, int]]:
+        """Find gaps between sync ranges, optionally within a target range.
+
+        Args:
+            peer_id: Telegram peer ID
+            target_min_id: If set, only return gaps >= this ID
+            target_max_id: If set, only return gaps <= this ID
+
+        Returns:
+            List of (gap_start_id, gap_end_id) tuples
+        """
+        ranges = self.get_sync_ranges(peer_id)
+        if not ranges:
+            # No ranges = everything is a gap
+            if target_min_id is not None and target_max_id is not None:
+                return [(target_min_id, target_max_id)]
+            return []
+
+        gaps: list[tuple[int, int]] = []
+
+        # Gap before first range (if target specifies earlier start)
+        if target_min_id is not None and target_min_id < ranges[0].min_msg_id:
+            gaps.append((target_min_id, ranges[0].min_msg_id - 1))
+
+        # Gaps between ranges
+        for i in range(len(ranges) - 1):
+            gap_start = ranges[i].max_msg_id + 1
+            gap_end = ranges[i + 1].min_msg_id - 1
+
+            if gap_end >= gap_start:
+                # Apply target filters
+                if target_min_id is not None:
+                    gap_start = max(gap_start, target_min_id)
+                if target_max_id is not None:
+                    gap_end = min(gap_end, target_max_id)
+
+                if gap_end >= gap_start:
+                    gaps.append((gap_start, gap_end))
+
+        # Gap after last range (if target specifies later end)
+        if target_max_id is not None and target_max_id > ranges[-1].max_msg_id:
+            gaps.append((ranges[-1].max_msg_id + 1, target_max_id))
+
+        return gaps
+
+    def find_gaps_in_date_range(
+        self,
+        peer_id: int,
+        start_date: datetime,
+        end_date: datetime,
+    ) -> list[tuple[datetime, datetime, int | None, int | None]]:
+        """Find gaps in sync coverage for a date range.
+
+        Args:
+            peer_id: Telegram peer ID
+            start_date: Start of requested range (UTC)
+            end_date: End of requested range (UTC)
+
+        Returns:
+            List of (gap_start_date, gap_end_date, approx_start_id, approx_end_id) tuples.
+            IDs are approximate based on adjacent ranges, or None if unknown.
+        """
+        start_ms = datetime_to_epoch_ms(start_date)
+        end_ms = datetime_to_epoch_ms(end_date)
+
+        ranges = self.get_sync_ranges(peer_id)
+        if not ranges:
+            # No ranges = entire requested range is a gap
+            return [(start_date, end_date, None, None)]
+
+        # Filter ranges that overlap with requested date range
+        relevant_ranges = [
+            r for r in ranges
+            if r.max_date_utc_ms >= start_ms and r.min_date_utc_ms <= end_ms
+        ]
+
+        if not relevant_ranges:
+            # No overlap = entire range is a gap
+            # Try to estimate IDs from nearest ranges
+            before = [r for r in ranges if r.max_date_utc_ms < start_ms]
+            after = [r for r in ranges if r.min_date_utc_ms > end_ms]
+
+            approx_start_id = before[-1].max_msg_id + 1 if before else None
+            approx_end_id = after[0].min_msg_id - 1 if after else None
+
+            return [(start_date, end_date, approx_start_id, approx_end_id)]
+
+        gaps: list[tuple[datetime, datetime, int | None, int | None]] = []
+
+        # Gap before first relevant range
+        first = relevant_ranges[0]
+        if first.min_date_utc_ms > start_ms:
+            gap_end_date = epoch_ms_to_datetime(first.min_date_utc_ms)
+            gaps.append((start_date, gap_end_date, None, first.min_msg_id - 1))
+
+        # Gaps between relevant ranges
+        for i in range(len(relevant_ranges) - 1):
+            curr = relevant_ranges[i]
+            next_r = relevant_ranges[i + 1]
+
+            # Only report gap if there's actually a time gap
+            if next_r.min_date_utc_ms > curr.max_date_utc_ms:
+                gap_start = epoch_ms_to_datetime(curr.max_date_utc_ms)
+                gap_end = epoch_ms_to_datetime(next_r.min_date_utc_ms)
+                gaps.append((
+                    gap_start, gap_end,
+                    curr.max_msg_id + 1, next_r.min_msg_id - 1
+                ))
+
+        # Gap after last relevant range
+        last = relevant_ranges[-1]
+        if last.max_date_utc_ms < end_ms:
+            gap_start_date = epoch_ms_to_datetime(last.max_date_utc_ms)
+            gaps.append((gap_start_date, end_date, last.max_msg_id + 1, None))
+
+        return gaps
+
+    def get_coverage_summary(self, peer_id: int) -> dict:
+        """Get a summary of sync coverage for a peer.
+
+        Args:
+            peer_id: Telegram peer ID
+
+        Returns:
+            Dict with coverage info: ranges, total_messages, gaps, etc.
+        """
+        ranges = self.get_sync_ranges(peer_id)
+
+        if not ranges:
+            return {
+                "ranges": [],
+                "total_messages": 0,
+                "total_ranges": 0,
+                "has_gaps": False,
+                "gaps": [],
+            }
+
+        gaps = self.find_gaps_in_ranges(peer_id)
+
+        return {
+            "ranges": [
+                {
+                    "min_msg_id": r.min_msg_id,
+                    "max_msg_id": r.max_msg_id,
+                    "min_date": epoch_ms_to_datetime(r.min_date_utc_ms),
+                    "max_date": epoch_ms_to_datetime(r.max_date_utc_ms),
+                    "message_count": r.message_count,
+                }
+                for r in ranges
+            ],
+            "total_messages": sum(r.message_count for r in ranges),
+            "total_ranges": len(ranges),
+            "has_gaps": len(gaps) > 0,
+            "gaps": gaps,
+            "oldest_date": epoch_ms_to_datetime(ranges[0].min_date_utc_ms),
+            "newest_date": epoch_ms_to_datetime(ranges[-1].max_date_utc_ms),
+        }
+
+
+@dataclass
+class SyncRange:
+    """Represents a contiguous range of synced messages."""
+
+    id: int | None
+    peer_id: int
+    min_msg_id: int
+    max_msg_id: int
+    min_date_utc_ms: int
+    max_date_utc_ms: int
+    message_count: int
 

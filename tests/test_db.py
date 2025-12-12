@@ -553,3 +553,169 @@ class TestExportFilterValidation:
             end_date=None,
         )
 
+
+class TestSyncRanges:
+    """Test sync range tracking and gap detection."""
+
+    def test_add_sync_range(self, db):
+        """Adding a sync range should work."""
+        db.update_peer(123, "test", "Test Peer", "channel")
+        db.commit()
+
+        db.add_sync_range(
+            peer_id=123,
+            min_msg_id=100,
+            max_msg_id=200,
+            min_date_utc_ms=1700000000000,
+            max_date_utc_ms=1700100000000,
+            message_count=50,
+        )
+        db.commit()
+
+        ranges = db.get_sync_ranges(123)
+        assert len(ranges) == 1
+        assert ranges[0].min_msg_id == 100
+        assert ranges[0].max_msg_id == 200
+        assert ranges[0].message_count == 50
+
+    def test_adjacent_ranges_are_merged(self, db):
+        """Adjacent ranges should be merged automatically."""
+        db.update_peer(123, "test", "Test Peer", "channel")
+        db.commit()
+
+        # Add first range: 100-200
+        db.add_sync_range(
+            peer_id=123,
+            min_msg_id=100,
+            max_msg_id=200,
+            min_date_utc_ms=1700000000000,
+            max_date_utc_ms=1700100000000,
+            message_count=50,
+        )
+        db.commit()
+
+        # Add adjacent range: 201-300 (should merge)
+        db.add_sync_range(
+            peer_id=123,
+            min_msg_id=201,
+            max_msg_id=300,
+            min_date_utc_ms=1700100000001,
+            max_date_utc_ms=1700200000000,
+            message_count=50,
+        )
+        db.commit()
+
+        ranges = db.get_sync_ranges(123)
+        assert len(ranges) == 1
+        assert ranges[0].min_msg_id == 100
+        assert ranges[0].max_msg_id == 300
+        assert ranges[0].message_count == 100
+
+    def test_overlapping_ranges_are_merged(self, db):
+        """Overlapping ranges should be merged."""
+        db.update_peer(123, "test", "Test Peer", "channel")
+        db.commit()
+
+        # Add first range: 100-200
+        db.add_sync_range(
+            peer_id=123,
+            min_msg_id=100,
+            max_msg_id=200,
+            min_date_utc_ms=1700000000000,
+            max_date_utc_ms=1700100000000,
+            message_count=50,
+        )
+        db.commit()
+
+        # Add overlapping range: 150-250 (should merge)
+        db.add_sync_range(
+            peer_id=123,
+            min_msg_id=150,
+            max_msg_id=250,
+            min_date_utc_ms=1700050000000,
+            max_date_utc_ms=1700150000000,
+            message_count=50,
+        )
+        db.commit()
+
+        ranges = db.get_sync_ranges(123)
+        assert len(ranges) == 1
+        assert ranges[0].min_msg_id == 100
+        assert ranges[0].max_msg_id == 250
+
+    def test_gap_detection(self, db):
+        """Gaps between ranges should be detected."""
+        db.update_peer(123, "test", "Test Peer", "channel")
+        db.commit()
+
+        # Add first range: 100-200
+        db.add_sync_range(
+            peer_id=123,
+            min_msg_id=100,
+            max_msg_id=200,
+            min_date_utc_ms=1700000000000,
+            max_date_utc_ms=1700100000000,
+            message_count=50,
+        )
+        db.commit()
+
+        # Add non-adjacent range: 500-600 (creates a gap)
+        db.add_sync_range(
+            peer_id=123,
+            min_msg_id=500,
+            max_msg_id=600,
+            min_date_utc_ms=1700200000000,
+            max_date_utc_ms=1700300000000,
+            message_count=50,
+        )
+        db.commit()
+
+        ranges = db.get_sync_ranges(123)
+        assert len(ranges) == 2
+
+        gaps = db.find_gaps_in_ranges(123)
+        assert len(gaps) == 1
+        assert gaps[0] == (201, 499)  # Gap between 200 and 500
+
+    def test_coverage_summary(self, db):
+        """Coverage summary should report correct info."""
+        db.update_peer(123, "test", "Test Peer", "channel")
+        db.commit()
+
+        # Add two ranges with a gap
+        db.add_sync_range(
+            peer_id=123,
+            min_msg_id=100,
+            max_msg_id=200,
+            min_date_utc_ms=1700000000000,
+            max_date_utc_ms=1700100000000,
+            message_count=50,
+        )
+        db.add_sync_range(
+            peer_id=123,
+            min_msg_id=500,
+            max_msg_id=600,
+            min_date_utc_ms=1700200000000,
+            max_date_utc_ms=1700300000000,
+            message_count=60,
+        )
+        db.commit()
+
+        summary = db.get_coverage_summary(123)
+        assert summary["total_messages"] == 110
+        assert summary["total_ranges"] == 2
+        assert summary["has_gaps"] is True
+        assert len(summary["gaps"]) == 1
+
+    def test_no_ranges_returns_empty(self, db):
+        """Peer with no ranges should return empty list."""
+        db.update_peer(123, "test", "Test Peer", "channel")
+        db.commit()
+
+        ranges = db.get_sync_ranges(123)
+        assert len(ranges) == 0
+
+        summary = db.get_coverage_summary(123)
+        assert summary["total_messages"] == 0
+        assert summary["has_gaps"] is False
+

@@ -8,7 +8,7 @@ from telethon import TelegramClient
 from telethon.errors import ChannelPrivateError, FloodWaitError, RPCError
 from telethon.tl.types import Channel, Chat, User
 
-from tgx.db import Database
+from tgx.db import Database, datetime_to_epoch_ms
 from tgx.utils import get_display_name, get_peer_id
 
 logger = logging.getLogger(__name__)
@@ -216,10 +216,12 @@ def _flush_batch(
 ) -> int:
     """Flush a batch of messages to the database.
 
+    Also updates stats with range metadata for sync range tracking.
+
     Args:
         db: Database instance
         batch: List of message dicts to insert
-        stats: Dict to update with inserted count
+        stats: Dict to update with inserted count and range info
 
     Returns:
         Number of messages inserted
@@ -230,6 +232,31 @@ def _flush_batch(
     inserted = db.insert_messages_batch(batch)
     db.commit()
     stats["total_inserted"] += inserted
+
+    # Track range metadata for this sync session
+    if inserted > 0:
+        batch_ids = [m["msg_id"] for m in batch]
+        batch_dates = [datetime_to_epoch_ms(m["date"]) for m in batch if m["date"]]
+
+        if batch_ids:
+            batch_min_id = min(batch_ids)
+            batch_max_id = max(batch_ids)
+
+            # Update session-wide range tracking
+            if stats.get("session_min_id") is None or batch_min_id < stats["session_min_id"]:
+                stats["session_min_id"] = batch_min_id
+            if stats.get("session_max_id") is None or batch_max_id > stats["session_max_id"]:
+                stats["session_max_id"] = batch_max_id
+
+        if batch_dates:
+            batch_min_date = min(batch_dates)
+            batch_max_date = max(batch_dates)
+
+            if stats.get("session_min_date_ms") is None or batch_min_date < stats["session_min_date_ms"]:
+                stats["session_min_date_ms"] = batch_min_date
+            if stats.get("session_max_date_ms") is None or batch_max_date > stats["session_max_date_ms"]:
+                stats["session_max_date_ms"] = batch_max_date
+
     return inserted
 
 
@@ -359,7 +386,14 @@ async def sync_peer(
                         tail_count += inserted
                         # Only advance cursor after successful commit
                         last_committed_id = max(m["msg_id"] for m in batch)
-                        logger.info(f"Committed batch: {inserted} messages")
+                        # Show progress with date range
+                        batch_dates = [m["date"] for m in batch if m["date"]]
+                        if batch_dates:
+                            oldest = min(batch_dates).strftime("%Y-%m-%d %H:%M")
+                            newest = max(batch_dates).strftime("%Y-%m-%d %H:%M")
+                            logger.info(f"  +{inserted} msgs [{oldest} → {newest}] (total: {stats['total_inserted']})")
+                        else:
+                            logger.info(f"  +{inserted} msgs (total: {stats['total_inserted']})")
                         batch = []
 
                     # Check shutdown between messages
@@ -370,7 +404,13 @@ async def sync_peer(
                 if batch:
                     inserted = _flush_batch(db, batch, stats)
                     tail_count += inserted
-                    logger.info(f"Committed batch: {inserted} messages")
+                    batch_dates = [m["date"] for m in batch if m["date"]]
+                    if batch_dates:
+                        oldest = min(batch_dates).strftime("%Y-%m-%d %H:%M")
+                        newest = max(batch_dates).strftime("%Y-%m-%d %H:%M")
+                        logger.info(f"  +{inserted} msgs [{oldest} → {newest}] (total: {stats['total_inserted']})")
+                    else:
+                        logger.info(f"  +{inserted} msgs (total: {stats['total_inserted']})")
                     batch = []
 
                 # Completed iteration successfully - reset retry count
@@ -509,7 +549,17 @@ async def sync_peer(
                             # Update resume point to lowest ID we've committed
                             if lowest_id_in_batch is not None:
                                 last_committed_max_id = lowest_id_in_batch
-                            logger.info(f"Committed batch: {inserted} messages")
+                            # Show progress with date range and target
+                            batch_dates = [m["date"] for m in batch if m["date"]]
+                            if batch_dates:
+                                oldest = min(batch_dates).strftime("%Y-%m-%d %H:%M")
+                                newest = max(batch_dates).strftime("%Y-%m-%d %H:%M")
+                                target_info = ""
+                                if min_date:
+                                    target_info = f" → target: {min_date.strftime('%Y-%m-%d %H:%M')}"
+                                logger.info(f"  +{inserted} msgs [{oldest} → {newest}]{target_info} (total: {stats['total_inserted']})")
+                            else:
+                                logger.info(f"  +{inserted} msgs (total: {stats['total_inserted']})")
                             batch = []
                             lowest_id_in_batch = None
 
@@ -523,7 +573,16 @@ async def sync_peer(
                         backfill_count += inserted
                         if lowest_id_in_batch is not None:
                             last_committed_max_id = lowest_id_in_batch
-                        logger.info(f"Committed batch: {inserted} messages")
+                        batch_dates = [m["date"] for m in batch if m["date"]]
+                        if batch_dates:
+                            oldest = min(batch_dates).strftime("%Y-%m-%d %H:%M")
+                            newest = max(batch_dates).strftime("%Y-%m-%d %H:%M")
+                            target_info = ""
+                            if min_date:
+                                target_info = f" → target: {min_date.strftime('%Y-%m-%d %H:%M')}"
+                            logger.info(f"  +{inserted} msgs [{oldest} → {newest}]{target_info} (total: {stats['total_inserted']})")
+                        else:
+                            logger.info(f"  +{inserted} msgs (total: {stats['total_inserted']})")
                         batch = []
 
                     # If we got no messages, we've reached the beginning of the chat
@@ -587,6 +646,19 @@ async def sync_peer(
             max_msg_id=actual_max_id if actual_max_id > 0 else None,
         )
         db.commit()
+
+    # Register this sync session as a range (if we inserted anything)
+    if stats["total_inserted"] > 0 and stats.get("session_min_id") is not None:
+        db.add_sync_range(
+            peer_id=peer_id,
+            min_msg_id=stats["session_min_id"],
+            max_msg_id=stats["session_max_id"],
+            min_date_utc_ms=stats["session_min_date_ms"],
+            max_date_utc_ms=stats["session_max_date_ms"],
+            message_count=stats["total_inserted"],
+        )
+        db.commit()
+        logger.debug(f"Registered sync range: [{stats['session_min_id']}, {stats['session_max_id']}]")
 
     final_min, final_max = db.get_sync_boundaries(peer_id)
     final_count = db.count_messages(peer_id)
