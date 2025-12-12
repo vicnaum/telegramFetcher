@@ -167,8 +167,10 @@ One message per line, optimized for AI/LLM consumption:
 One JSON object per line:
 
 ```json
-{"id": 12345, "peer_id": -1001234567890, "date": "2025-01-15T09:30:45+00:00", "sender_id": 111, "sender_name": "Alice", "text": "Hello", "reply_to_msg_id": null, "has_media": false, "media_type": null}
+{"id": 12345, "peer_id": -1001234567890, "date": "2025-01-15T09:30:45+00:00", "date_utc_ms": 1736934645000, "sender_id": 111, "sender_name": "Alice", "text": "Hello", "reply_to_msg_id": null, "has_media": false, "media_type": null}
 ```
+
+With `--include-raw`, the `raw_data` field contains the full Telethon message object (parsed JSON, not a string). Use `--raw-as-string` to emit it as a JSON string instead.
 
 ## Peer Input Formats
 
@@ -177,7 +179,8 @@ You can specify peers in multiple ways:
 - `@username` - Public username
 - `https://t.me/username` - Telegram link
 - `-1001234567890` - Peer ID (channels start with -100)
-- `Chat Title` - Exact title match (if in your dialogs)
+
+> **Note:** Title-based lookup is not supported. Use `dialogs --search "keyword"` to find peer IDs.
 
 ## Security Notes
 
