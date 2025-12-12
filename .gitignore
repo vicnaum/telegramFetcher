@@ -1,0 +1,46 @@
+# Credentials and session (NEVER commit these!)
+.env
+*.session
+fcm
+
+# Database
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Export output files
+out.txt
+out.jsonl
+*.export.txt
+*.export.jsonl
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# uv
+.python-version
+
+# repomix
+repomix/
+

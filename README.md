@@ -1,0 +1,233 @@
+# tgx - Personal Telegram Exporter
+
+A CLI tool to archive and export Telegram chat history from channels and groups you are a member of.
+
+## Features
+
+- **Login as yourself** via MTProto (Telethon) - no bot required
+- **Incremental sync** - only fetches new messages on subsequent runs
+- **Local SQLite database** - messages cached locally, no re-fetching
+- **Export formats**: TXT (one message per line) and JSONL
+- **Rate limit handling** - automatic sleep on FloodWait errors
+- **Graceful shutdown** - Ctrl+C saves state safely
+
+## Installation
+
+Requires Python 3.10+.
+
+```bash
+# Using uv (recommended)
+cd telegramFetcher
+uv sync
+
+# Or using pip
+pip install -e .
+```
+
+## Setup
+
+### 1. Get Telegram API Credentials
+
+You need API credentials to use Telegram's MTProto protocol. This is a **one-time setup** that takes ~2 minutes:
+
+1. **Go to** https://my.telegram.org/auth
+2. **Log in** with your phone number (you'll receive a code in Telegram)
+3. **Click** "API development tools"
+4. **Fill the form** (all fields can be anything):
+   - App title: `My Exporter` (or whatever you want)
+   - Short name: `myexporter` (lowercase, no spaces)
+   - Platform: `Desktop`
+   - Description: `Personal use`
+5. **Click** "Create application"
+6. **Copy** your `api_id` (a number) and `api_hash` (a long hex string)
+
+> ⚠️ **Keep these secret!** Don't share them or commit to git.
+
+### 2. Configure Environment
+
+**Option A: Use a `.env` file (recommended)**
+
+```bash
+cp .env.example .env
+# Edit .env with your actual credentials
+```
+
+Your `.env` file should look like:
+```bash
+TGX_API_ID=12345678
+TGX_API_HASH=abcdef1234567890abcdef1234567890
+```
+
+**Option B: Export in terminal**
+
+```bash
+export TGX_API_ID=12345678
+export TGX_API_HASH=abcdef1234567890abcdef1234567890
+```
+
+**Optional settings:**
+```bash
+TGX_SESSION=./my_session.session  # Custom session file path
+TGX_DB=./my_data.sqlite           # Custom database path
+```
+
+## Usage
+
+### First run - Authenticate
+
+```bash
+uv run python -m tgx.main auth-test
+```
+
+**QR Code Login (default):**
+1. A QR code will be displayed in your terminal
+2. Open Telegram on your phone → Settings → Devices → Link Desktop Device
+3. Scan the QR code
+4. If you have 2FA enabled, enter your password
+
+**Phone Login (alternative):**
+```bash
+uv run python -m tgx.main auth-test --phone
+```
+
+On success, you'll see "AUTHORIZED" and your session is saved to `tgx.session`.
+
+### Session Caching
+
+**Your login is cached!** After the first successful authentication:
+- The session is stored in `tgx.session` file
+- Subsequent runs skip login entirely
+- To re-authenticate, delete the session file
+
+### Find a chat to export
+
+```bash
+# List your dialogs
+uv run python -m tgx.main dialogs
+
+# Search for specific chats
+uv run python -m tgx.main dialogs --search "crypto"
+```
+
+### Test fetching
+
+```bash
+# Fetch 5 messages to verify access
+uv run python -m tgx.main fetch-test --peer @channelname --limit 5
+```
+
+### Export messages
+
+```bash
+# Export last 100 messages to TXT
+uv run python -m tgx.main export --peer @channelname --last 100 --txt out.txt
+
+# Export to both formats
+uv run python -m tgx.main export --peer @channelname --last 1000 --txt out.txt --jsonl out.jsonl
+
+# Export by date range
+uv run python -m tgx.main export --peer @channelname --start "2025-01-01" --end "2025-01-31" --txt january.txt
+
+# Export by message ID range
+uv run python -m tgx.main export --peer @channelname --since-id 5000 --until-id 6000 --jsonl range.jsonl
+
+# Include raw JSON data in JSONL
+uv run python -m tgx.main export --peer @channelname --last 100 --jsonl out.jsonl --include-raw
+```
+
+### Sync only (without export)
+
+```bash
+# Sync last 100 messages to local DB
+uv run python -m tgx.main sync --peer @channelname --last 100
+```
+
+## Output Formats
+
+### TXT Format
+
+One message per line, optimized for AI/LLM consumption:
+
+```
+2025-01-15 10:30:45 | Alice | Hey everyone, check out this news article!
+2025-01-15 10:31:02 | Bob | Interesting, thanks for sharing
+2025-01-15 10:32:15 | channel | [photo]
+```
+
+- Timestamps are in local timezone
+- Newlines in messages are flattened to spaces
+- Media messages show `[media_type]`
+
+### JSONL Format
+
+One JSON object per line:
+
+```json
+{"id": 123, "peer_id": -1001234567890, "date": "2025-01-15T09:30:45+00:00", "sender_id": 111, "sender_name": "Alice", "text": "Hello", "has_media": false, "media_type": null}
+```
+
+## Peer Input Formats
+
+You can specify peers in multiple ways:
+
+- `@username` - Public username
+- `https://t.me/username` - Telegram link
+- `-1001234567890` - Peer ID (channels start with -100)
+- `Chat Title` - Exact title match (if in your dialogs)
+
+## Security Notes
+
+⚠️ **Important:**
+
+- The `.session` file contains your Telegram login. **Keep it private!**
+- Add `*.session` to your `.gitignore`
+- The session file allows full access to your Telegram account
+- If compromised, revoke all sessions at https://my.telegram.org
+
+## Limitations (MVP)
+
+- **No forum topics/threads** - Only main chat history
+- **No media downloads** - Only `has_media` flag and `media_type` stored
+- **No reactions** - Not captured
+- **No edit history** - Only original message stored (append-only)
+- **No deletions** - Deleted messages remain in local DB
+
+## Files
+
+- `tgx.session` - Telegram session (encrypted credentials)
+- `tgx.sqlite` - Local message database (WAL mode)
+
+## Troubleshooting
+
+### "Could not find entity"
+
+- Make sure you've joined the channel/group
+- Try using the peer_id instead of username
+
+### "ChannelPrivateError"
+
+- The channel is private or you were kicked/banned
+
+### "FloodWaitError"
+
+- The tool handles this automatically
+- For large syncs (>5000 messages), expect occasional waits
+
+### Session expired
+
+- Delete the `.session` file and re-authenticate
+
+## Development
+
+```bash
+# Install dev dependencies
+uv sync
+
+# Run directly
+uv run python -m tgx.main --help
+```
+
+## License
+
+MIT
+
