@@ -2,9 +2,11 @@
 
 import json
 import logging
+import time
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from tgx.db import Database, epoch_ms_to_datetime
 from tgx.utils import flatten_text
@@ -13,12 +15,42 @@ logger = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=1)
-def get_local_timezone():
-    """Get the local timezone (cached).
+def get_local_timezone() -> ZoneInfo | timezone:
+    """Get the local timezone as a ZoneInfo object (cached).
 
-    Uses lru_cache to avoid repeated system calls.
-    The cache persists for the lifetime of the process.
+    Attempts to detect the IANA timezone name and return a proper ZoneInfo
+    that handles DST correctly. Falls back to the system's fixed-offset
+    tzinfo if detection fails.
+
+    Returns:
+        ZoneInfo for the local timezone, or fixed-offset tzinfo as fallback
     """
+    # Try to get IANA zone name from environment or system
+    tz_name = time.tzname[0] if time.tzname else None
+
+    # On macOS/Linux, try reading the symlink target of /etc/localtime
+    if tz_name is None or tz_name in ("", "UTC", "GMT"):
+        try:
+            import os
+            localtime_path = Path("/etc/localtime")
+            if localtime_path.is_symlink():
+                target = os.readlink(localtime_path)
+                # Extract IANA name from path like /usr/share/zoneinfo/America/New_York
+                if "zoneinfo/" in target:
+                    tz_name = target.split("zoneinfo/")[-1]
+        except (OSError, AttributeError):
+            pass
+
+    # Try to create ZoneInfo from detected name
+    if tz_name:
+        try:
+            return ZoneInfo(tz_name)
+        except (KeyError, ValueError):
+            # Invalid timezone name, try common mappings
+            pass
+
+    # Fallback: use the system's current offset (may not handle DST correctly)
+    logger.debug("Could not detect IANA timezone, using fixed offset")
     return datetime.now().astimezone().tzinfo
 
 
@@ -35,7 +67,7 @@ def utc_to_local(utc_dt: datetime) -> datetime:
         # Assume UTC if naive
         utc_dt = utc_dt.replace(tzinfo=timezone.utc)
 
-    # Use cached timezone
+    # Use cached timezone (ZoneInfo handles DST correctly)
     return utc_dt.astimezone(get_local_timezone())
 
 

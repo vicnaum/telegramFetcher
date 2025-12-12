@@ -47,7 +47,9 @@ def _setup_signal_handlers() -> None:
 
     def handle_signal() -> None:
         """Signal handler that sets the shutdown event."""
-        print("\n\nInterrupted! Requesting graceful shutdown...")
+        # Use print here as logger may not be fully configured in signal context
+        # and we want immediate user feedback
+        logger.warning("\nInterrupted! Requesting graceful shutdown...")
         if _shutdown_event is not None:
             _shutdown_event.set()
 
@@ -65,32 +67,34 @@ def _setup_signal_handlers() -> None:
 async def _cleanup_resources() -> None:
     """Clean up database and client resources.
 
-    Uses asyncio.shield for the final commit to ensure data is saved
-    even during cancellation.
+    Commits and closes DB first (synchronous, cannot be interrupted by
+    CancelledError), then disconnects client.
     """
     global _current_db, _current_client
 
-    # Disconnect client first (network resource)
-    if _current_client is not None:
-        try:
-            if _current_client.is_connected():
-                await _current_client.disconnect()
-                print("Client disconnected.")
-        except Exception as e:
-            logger.debug(f"Error disconnecting client: {e}")
-        finally:
-            _current_client = None
-
-    # Commit and close database (must be on same thread as connection was created)
+    # Commit and close database first (synchronous - cannot be interrupted)
+    # This ensures data is saved even if client disconnect gets cancelled
     if _current_db is not None:
         try:
             _current_db.commit()
             _current_db.close()
-            print("Database saved and closed.")
+            logger.info("Database saved and closed.")
         except Exception as e:
             logger.error(f"Error closing database: {e}")
         finally:
             _current_db = None
+
+    # Disconnect client (may involve network I/O)
+    if _current_client is not None:
+        try:
+            if _current_client.is_connected():
+                await _current_client.disconnect()
+                logger.info("Client disconnected.")
+        except BaseException as e:
+            # Catch BaseException to handle CancelledError too
+            logger.debug(f"Error disconnecting client: {e}")
+        finally:
+            _current_client = None
 
 
 async def run_with_graceful_shutdown(
@@ -127,14 +131,14 @@ async def run_with_graceful_shutdown(
 
         # If shutdown was signaled (not task completion)
         if shutdown_waiter in done and main_task in pending:
-            print("Shutdown requested, waiting for task to finish...")
+            logger.info("Shutdown requested, waiting for task to finish...")
 
             # Give the task time to finish gracefully
             try:
                 result = await asyncio.wait_for(main_task, timeout=SHUTDOWN_TIMEOUT)
                 return result
             except asyncio.TimeoutError:
-                print(f"Task did not finish within {SHUTDOWN_TIMEOUT}s, cancelling...")
+                logger.warning(f"Task did not finish within {SHUTDOWN_TIMEOUT}s, cancelling...")
                 main_task.cancel()
                 try:
                     await main_task
@@ -157,7 +161,7 @@ async def run_with_graceful_shutdown(
         return 0
 
     except asyncio.CancelledError:
-        print("Operation cancelled.")
+        logger.warning("Operation cancelled.")
         return 130
     finally:
         await _cleanup_resources()
@@ -375,7 +379,7 @@ def run_async_with_shutdown(coro: Coroutine[Any, Any, int]) -> int:
         return asyncio.run(run_with_graceful_shutdown(coro))
     except KeyboardInterrupt:
         # Windows fallback: KeyboardInterrupt is raised instead of signal handler
-        print("\n\nInterrupted! Cleaning up...")
+        logger.warning("\nInterrupted! Cleaning up...")
         # The cleanup already happened in run_with_graceful_shutdown's finally block
         return 130
 
@@ -404,21 +408,21 @@ def main() -> int:
             try:
                 return asyncio.run(auth_test(use_phone=args.phone))
             except KeyboardInterrupt:
-                print("\n\nInterrupted!")
+                logger.warning("\nInterrupted!")
                 return 130
 
         if args.command == "dialogs":
             try:
                 return asyncio.run(list_dialogs(search=args.search, limit=args.limit))
             except KeyboardInterrupt:
-                print("\n\nInterrupted!")
+                logger.warning("\nInterrupted!")
                 return 130
 
         if args.command == "fetch-test":
             try:
                 return asyncio.run(fetch_test(peer_input=args.peer, limit=args.limit))
             except KeyboardInterrupt:
-                print("\n\nInterrupted!")
+                logger.warning("\nInterrupted!")
                 return 130
 
         # Commands that need graceful shutdown (database operations)
@@ -448,7 +452,7 @@ def main() -> int:
             ))
 
     except ConfigurationError as e:
-        print(f"Error: {e}")
+        logger.error(f"Error: {e}")
         return 1
 
     return 0
@@ -554,15 +558,21 @@ async def run_export(
 
     # Determine target count for sync
     # - With --last: sync exactly that many
-    # - With date/ID filters (start_date, since_id): sync only until boundary (no minimum)
+    # - With date/ID filters: sync until boundary (no minimum count)
     # - No filters: sync a reasonable default (1000)
     if last_n is not None:
         target_count = last_n
-    elif start_date or since_id:
+    elif start_date or end_date or since_id or until_id:
         # Date/ID filters specified - sync until boundary, no minimum count
         target_count = 0
     else:
         target_count = 1000
+
+    # Derive sync boundaries from whichever bound is provided
+    # If only --end is given, we still need to backfill to have messages up to that point
+    # If only --until-id is given, we need messages up to that ID
+    sync_min_date = start_dt or end_dt
+    sync_min_id = since_id or until_id
 
     client = create_client()
     db = Database()
@@ -595,13 +605,14 @@ async def run_export(
 
         # Step 2: Sync (with boundary-aware backfill for date/ID filters)
         # Pass resolved entity and shutdown_event for graceful interruption
+        # sync_min_date/sync_min_id derived above to handle --end/--until-id correctly
         logger.info("--- Syncing ---")
         await sync_peer(
             client=client,
             db=db,
             target_count=target_count,
-            min_date=start_dt,   # Backfill until we have messages at this date
-            min_id=since_id,     # Or until we have messages at this ID
+            min_date=sync_min_date,   # Backfill until we have messages at this date
+            min_id=sync_min_id,       # Or until we have messages at this ID
             entity=entity,
             peer_id=peer_id,
             shutdown_event=_shutdown_event,
