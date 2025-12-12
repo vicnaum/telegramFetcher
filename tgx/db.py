@@ -80,8 +80,7 @@ class Database:
                 type TEXT,
                 min_msg_id INTEGER DEFAULT 0,
                 max_msg_id INTEGER DEFAULT 0,
-                last_sync_ts INTEGER,
-                raw_data TEXT
+                last_sync_ts INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_peers_username ON peers(username);
 
@@ -104,6 +103,24 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_msg_reply ON messages(peer_id, reply_to_msg_id);
         """)
         self.conn.commit()
+
+        # Run migrations for existing databases
+        self._run_migrations()
+
+    def _run_migrations(self) -> None:
+        """Run database migrations for schema updates."""
+        # Check if peers.raw_data column exists and drop it
+        cursor = self.conn.execute("PRAGMA table_info(peers)")
+        columns = [row[1] for row in cursor.fetchall()]
+
+        if "raw_data" in columns:
+            # SQLite 3.35+ supports ALTER TABLE DROP COLUMN
+            try:
+                self.conn.execute("ALTER TABLE peers DROP COLUMN raw_data")
+                self.conn.commit()
+            except sqlite3.OperationalError:
+                # Older SQLite - just ignore, the column will be unused
+                pass
 
     def __enter__(self) -> "Database":
         """Context manager entry."""
@@ -129,7 +146,6 @@ class Database:
         username: str | None,
         title: str,
         peer_type: str,
-        raw_data: str | None = None,
     ) -> None:
         """Upsert peer metadata.
 
@@ -138,17 +154,15 @@ class Database:
             username: Optional username
             title: Display title
             peer_type: Type ('user', 'group', 'channel')
-            raw_data: Optional JSON dump of entity
         """
         self.conn.execute("""
-            INSERT INTO peers (id, username, title, type, raw_data)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO peers (id, username, title, type)
+            VALUES (?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 username = excluded.username,
                 title = excluded.title,
-                type = excluded.type,
-                raw_data = COALESCE(excluded.raw_data, peers.raw_data)
-        """, (peer_id, username, title, peer_type, raw_data))
+                type = excluded.type
+        """, (peer_id, username, title, peer_type))
 
     def update_peer_sync_boundaries(
         self,
@@ -216,6 +230,56 @@ class Database:
 
         return row["cnt"] if row else 0
 
+    def get_oldest_message_date(self, peer_id: int) -> datetime | None:
+        """Get the date of the oldest message for a peer.
+
+        Args:
+            peer_id: Telegram peer ID
+
+        Returns:
+            Datetime of oldest message, or None if no messages
+        """
+        row = self.conn.execute("""
+            SELECT MIN(date_utc_ms) as min_date FROM messages WHERE peer_id = ?
+        """, (peer_id,)).fetchone()
+
+        if row and row["min_date"] is not None:
+            return epoch_ms_to_datetime(row["min_date"])
+        return None
+
+    def has_message_at_or_before_date(self, peer_id: int, target_date: datetime) -> bool:
+        """Check if we have a message at or before the target date.
+
+        Args:
+            peer_id: Telegram peer ID
+            target_date: Target datetime (UTC)
+
+        Returns:
+            True if we have a message at or before target_date
+        """
+        target_ms = datetime_to_epoch_ms(target_date)
+        row = self.conn.execute("""
+            SELECT 1 FROM messages WHERE peer_id = ? AND date_utc_ms <= ? LIMIT 1
+        """, (peer_id, target_ms)).fetchone()
+
+        return row is not None
+
+    def has_message_at_or_before_id(self, peer_id: int, target_id: int) -> bool:
+        """Check if we have a message at or before the target ID.
+
+        Args:
+            peer_id: Telegram peer ID
+            target_id: Target message ID
+
+        Returns:
+            True if we have a message with ID <= target_id
+        """
+        row = self.conn.execute("""
+            SELECT 1 FROM messages WHERE peer_id = ? AND id <= ? LIMIT 1
+        """, (peer_id, target_id)).fetchone()
+
+        return row is not None
+
     def insert_message(
         self,
         msg_id: int,
@@ -277,6 +341,9 @@ class Database:
     def insert_messages_batch(self, messages: list[dict]) -> tuple[int, list[str]]:
         """Insert multiple messages in a batch using executemany.
 
+        Uses INSERT OR IGNORE to efficiently handle duplicates without per-row
+        exception handling. The inserted count is calculated via total_changes delta.
+
         Args:
             messages: List of message dicts with keys matching insert_message args
 
@@ -303,32 +370,21 @@ class Database:
                 msg["media_type"], msg["raw_data"]
             ))
 
-        # Use INSERT OR IGNORE for duplicates, but we track what was actually inserted
-        # by comparing row counts before and after
-        errors: list[str] = []
-        inserted = 0
+        # Use INSERT OR IGNORE with executemany for efficiency
+        # Track inserted count via total_changes delta
+        changes_before = self.conn.total_changes
 
-        # Process in a transaction for efficiency
-        for row in rows:
-            try:
-                cursor = self.conn.execute("""
-                    INSERT INTO messages
-                    (id, peer_id, date_utc_ms, sender_id, sender_name, text,
-                     reply_to_msg_id, has_media, media_type, raw_data)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, row)
-                if cursor.rowcount == 1:
-                    inserted += 1
-            except sqlite3.IntegrityError as e:
-                err_str = str(e)
-                if "UNIQUE constraint failed" in err_str or "PRIMARY KEY" in err_str:
-                    # Duplicate - expected, skip silently
-                    pass
-                else:
-                    # Other constraint error - log it
-                    errors.append(f"Message {row[0]}: {err_str}")
+        self.conn.executemany("""
+            INSERT OR IGNORE INTO messages
+            (id, peer_id, date_utc_ms, sender_id, sender_name, text,
+             reply_to_msg_id, has_media, media_type, raw_data)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, rows)
 
-        return (inserted, errors)
+        inserted = self.conn.total_changes - changes_before
+
+        # No per-row error tracking in fast path - INSERT OR IGNORE handles duplicates
+        return (inserted, [])
 
     def get_messages(
         self,
@@ -376,8 +432,15 @@ class Database:
             params.append(end_ms)
 
         order = "DESC" if order_desc else "ASC"
-        # Fix: explicitly check for None vs 0
-        limit_clause = f"LIMIT {limit}" if limit is not None else ""
+
+        # Parameterize LIMIT clause
+        if limit is not None:
+            if limit < 0:
+                raise ValueError(f"Limit must be non-negative, got {limit}")
+            limit_clause = "LIMIT ?"
+            params.append(limit)
+        else:
+            limit_clause = ""
 
         query = f"""
             SELECT * FROM messages
@@ -415,12 +478,16 @@ class Database:
             Database rows in chronological order
         """
         if last_n is not None:
-            # Get the last N messages, then return in chronological order
-            rows = list(self.get_messages(
-                peer_id, limit=last_n, order_desc=True
-            ))
-            # Reverse to get chronological order
-            yield from reversed(rows)
+            # Use SQL subquery to get last N in chronological order
+            # This avoids materializing and reversing in Python
+            query = """
+                SELECT * FROM (
+                    SELECT * FROM messages WHERE peer_id = ?
+                    ORDER BY date_utc_ms DESC, id DESC LIMIT ?
+                ) ORDER BY date_utc_ms ASC, id ASC
+            """
+            cursor = self.conn.execute(query, [peer_id, last_n])
+            yield from cursor
         else:
             # Apply filters and return in chronological order
             yield from self.get_messages(
@@ -431,4 +498,75 @@ class Database:
                 end_date=end_date,
                 order_desc=False,
             )
+
+    def get_messages_for_export_with_reply_sender(
+        self,
+        peer_id: int,
+        last_n: int | None = None,
+        since_id: int | None = None,
+        until_id: int | None = None,
+        start_date: datetime | None = None,
+        end_date: datetime | None = None,
+    ) -> Iterator[sqlite3.Row]:
+        """Get messages for export with reply sender info via LEFT JOIN.
+
+        This is a streaming-friendly method that includes reply_sender_name
+        for each message without needing a second pass.
+
+        Args:
+            peer_id: Peer ID to query
+            last_n: Get last N messages
+            since_id: Minimum message ID (exclusive)
+            until_id: Maximum message ID (exclusive)
+            start_date: Start datetime (inclusive, UTC)
+            end_date: End datetime (inclusive, UTC)
+
+        Yields:
+            Database rows in chronological order with additional reply_sender_name column
+        """
+        if last_n is not None:
+            # Use SQL subquery to get last N with reply sender
+            query = """
+                SELECT m.*, r.sender_name as reply_sender_name
+                FROM (
+                    SELECT * FROM messages WHERE peer_id = ?
+                    ORDER BY date_utc_ms DESC, id DESC LIMIT ?
+                ) m
+                LEFT JOIN messages r ON m.peer_id = r.peer_id AND m.reply_to_msg_id = r.id
+                ORDER BY m.date_utc_ms ASC, m.id ASC
+            """
+            cursor = self.conn.execute(query, [peer_id, last_n])
+            yield from cursor
+        else:
+            # Build filtered query with LEFT JOIN
+            conditions = ["m.peer_id = ?"]
+            params: list = [peer_id]
+
+            if since_id is not None:
+                conditions.append("m.id > ?")
+                params.append(since_id)
+
+            if until_id is not None:
+                conditions.append("m.id < ?")
+                params.append(until_id)
+
+            if start_date is not None:
+                start_ms = datetime_to_epoch_ms(start_date)
+                conditions.append("m.date_utc_ms >= ?")
+                params.append(start_ms)
+
+            if end_date is not None:
+                end_ms = datetime_to_epoch_ms(end_date)
+                conditions.append("m.date_utc_ms <= ?")
+                params.append(end_ms)
+
+            query = f"""
+                SELECT m.*, r.sender_name as reply_sender_name
+                FROM messages m
+                LEFT JOIN messages r ON m.peer_id = r.peer_id AND m.reply_to_msg_id = r.id
+                WHERE {' AND '.join(conditions)}
+                ORDER BY m.date_utc_ms ASC, m.id ASC
+            """
+            cursor = self.conn.execute(query, params)
+            yield from cursor
 

@@ -11,7 +11,7 @@ import qrcode
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError
 
-from tgx.utils import get_display_name, get_peer_id, truncate_text
+from tgx.utils import get_display_name, get_peer_id, normalize_peer_input, truncate_text
 
 logger = logging.getLogger(__name__)
 
@@ -195,27 +195,55 @@ async def phone_login(client: TelegramClient) -> bool:
     Returns:
         True if successful, False otherwise
     """
+    from telethon.errors import FloodWaitError, PhoneNumberInvalidError, PhoneCodeInvalidError
+
     print("\n📞 Phone Login")
     print("=" * 40)
 
-    phone = input("Enter your phone number (with country code, e.g., +1234567890): ").strip()
-
-    await client.send_code_request(phone)
-
-    code = input("Enter the code you received: ").strip()
-
     try:
-        await client.sign_in(phone, code)
-        print("\n✅ Successfully logged in!")
-        return True
+        phone = input("Enter your phone number (with country code, e.g., +1234567890): ").strip()
 
-    except SessionPasswordNeededError:
-        print("\n🔐 Two-factor authentication is enabled.")
-        password = getpass("Enter your 2FA password: ")
-        await client.sign_in(password=password)
-        print("✅ Successfully logged in with 2FA!")
-        return True
+        if not phone:
+            print("❌ Phone number cannot be empty")
+            return False
 
+        try:
+            await client.send_code_request(phone)
+        except PhoneNumberInvalidError:
+            print("❌ Invalid phone number format. Use international format (e.g., +1234567890)")
+            return False
+        except FloodWaitError as e:
+            print(f"❌ Too many attempts. Please wait {e.seconds} seconds before trying again.")
+            return False
+
+        code = input("Enter the code you received: ").strip()
+
+        if not code:
+            print("❌ Code cannot be empty")
+            return False
+
+        try:
+            await client.sign_in(phone, code)
+            print("\n✅ Successfully logged in!")
+            return True
+
+        except PhoneCodeInvalidError:
+            print("❌ Invalid code. Please try again.")
+            return False
+        except SessionPasswordNeededError:
+            print("\n🔐 Two-factor authentication is enabled.")
+            password = getpass("Enter your 2FA password: ")
+            try:
+                await client.sign_in(password=password)
+                print("✅ Successfully logged in with 2FA!")
+                return True
+            except Exception as e:
+                print(f"❌ 2FA authentication failed: {e}")
+                return False
+
+    except KeyboardInterrupt:
+        print("\n⚠️ Login cancelled by user")
+        return False
     except Exception as e:
         print(f"\n❌ Phone login failed: {e}")
         return False
@@ -353,11 +381,13 @@ async def fetch_test(peer_input: str, limit: int = 5) -> int:
     try:
         await ensure_authorized(client)
 
+        # Normalize peer input (handle t.me links, etc.)
+        normalized_peer = normalize_peer_input(peer_input)
         print(f"Resolving peer: {peer_input}...")
 
         # Resolve the peer
         try:
-            input_entity = await client.get_input_entity(peer_input)
+            input_entity = await client.get_input_entity(normalized_peer)
             entity = await client.get_entity(input_entity)
         except ValueError:
             print(f"Error: Could not find entity '{peer_input}'")

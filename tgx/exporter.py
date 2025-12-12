@@ -4,6 +4,7 @@ import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
+from functools import lru_cache
 
 from tgx.db import Database, epoch_ms_to_datetime
 from tgx.utils import flatten_text
@@ -11,8 +12,13 @@ from tgx.utils import flatten_text
 logger = logging.getLogger(__name__)
 
 
+@lru_cache(maxsize=1)
 def get_local_timezone():
-    """Get the local timezone."""
+    """Get the local timezone (cached).
+
+    Uses lru_cache to avoid repeated system calls.
+    The cache persists for the lifetime of the process.
+    """
     return datetime.now().astimezone().tzinfo
 
 
@@ -29,6 +35,7 @@ def utc_to_local(utc_dt: datetime) -> datetime:
         # Assume UTC if naive
         utc_dt = utc_dt.replace(tzinfo=timezone.utc)
 
+    # Use cached timezone
     return utc_dt.astimezone(get_local_timezone())
 
 
@@ -93,6 +100,60 @@ def format_txt_line(row, sender_lookup: dict[int, str] | None = None) -> str:
         reply_sender = ""
         if sender_lookup and reply_to_msg_id in sender_lookup:
             reply_sender = f" @{sender_lookup[reply_to_msg_id]}"
+        text = f"[reply to #{reply_to_msg_id}{reply_sender}] {text}"
+
+    return f"[{msg_id}] {time_str} | {sender} | {text}"
+
+
+def format_txt_line_streaming(row) -> str:
+    """Format a database row as a TXT line (streaming version).
+
+    This version uses reply_sender_name from the row (via LEFT JOIN) instead
+    of needing a separate lookup dict.
+
+    Format: "[msg_id] YYYY-MM-DD HH:MM:SS | sender | text"
+    With reply: "[msg_id] YYYY-MM-DD HH:MM:SS | sender | [reply to #123 @name] text"
+
+    Args:
+        row: Database row with date_utc_ms and reply_sender_name fields
+
+    Returns:
+        Formatted line
+    """
+    msg_id = row["id"]
+
+    # Get datetime from epoch_ms and convert to local
+    dt = get_datetime_from_row(row)
+
+    if dt:
+        local_dt = utc_to_local(dt)
+        time_str = local_dt.strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        time_str = "unknown"
+
+    # Get sender
+    sender = row["sender_name"]
+    if not sender:
+        sender_id = row["sender_id"]
+        sender = f"user_{sender_id}" if sender_id else "channel"
+
+    # Get text (flatten newlines)
+    text = flatten_text(row["text"])
+    if not text:
+        if row["has_media"]:
+            media_type = row["media_type"] or "media"
+            text = f"[{media_type}]"
+        else:
+            text = "[empty]"
+
+    # Handle reply (use reply_sender_name from JOIN)
+    reply_to_msg_id = row["reply_to_msg_id"]
+    if reply_to_msg_id:
+        reply_sender = ""
+        # reply_sender_name comes from the LEFT JOIN
+        reply_sender_name = row["reply_sender_name"]
+        if reply_sender_name:
+            reply_sender = f" @{reply_sender_name}"
         text = f"[reply to #{reply_to_msg_id}{reply_sender}] {text}"
 
     return f"[{msg_id}] {time_str} | {sender} | {text}"
@@ -222,6 +283,9 @@ def export_txt(
 ) -> int:
     """Export messages to TXT format.
 
+    Uses streaming export with SQL JOIN to get reply sender info efficiently.
+    Does not materialize all rows in memory.
+
     Args:
         db: Database instance
         peer_id: Peer ID to export
@@ -236,28 +300,23 @@ def export_txt(
         Number of messages exported
     """
     output_path = Path(output_path)
+    count = 0
 
-    # First pass: collect all messages and reply IDs
-    rows = list(db.get_messages_for_export(
-        peer_id,
-        last_n=last_n,
-        since_id=since_id,
-        until_id=until_id,
-        start_date=start_date,
-        end_date=end_date,
-    ))
-
-    # Build sender lookup only for replied-to messages
-    reply_ids = collect_reply_ids(rows)
-    sender_lookup = build_sender_lookup_for_replies(db, peer_id, reply_ids)
-
-    # Write output
+    # Stream export with LEFT JOIN for reply sender
     with open(output_path, "w", encoding="utf-8") as f:
-        for row in rows:
-            line = format_txt_line(row, sender_lookup=sender_lookup)
+        for row in db.get_messages_for_export_with_reply_sender(
+            peer_id,
+            last_n=last_n,
+            since_id=since_id,
+            until_id=until_id,
+            start_date=start_date,
+            end_date=end_date,
+        ):
+            line = format_txt_line_streaming(row)
             f.write(line + "\n")
+            count += 1
 
-    return len(rows)
+    return count
 
 
 def export_jsonl(

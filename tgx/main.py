@@ -14,40 +14,68 @@ from tgx.client import auth_test, create_client, ensure_authorized, fetch_test, 
 from tgx.db import Database
 from tgx.exporter import export_messages
 from tgx.sync import sync_peer
-from tgx.utils import get_display_name, get_peer_id
+from tgx.utils import get_display_name, get_peer_id, normalize_peer_input
 
 logger = logging.getLogger(__name__)
 
 # Global references for graceful shutdown
 _current_db: Database | None = None
 _current_client: TelegramClient | None = None
+_shutdown_event: asyncio.Event | None = None
 
 
-def _signal_handler(signum, frame):
-    """Handle Ctrl+C gracefully."""
-    print("\n\nInterrupted! Cleaning up...")
+def _setup_signal_handlers():
+    """Set up signal handlers for graceful shutdown in async context."""
+    global _shutdown_event
 
-    # Disconnect Telethon client (best-effort)
-    if _current_client is not None:
-        try:
-            # Note: We can't await in a signal handler, so we do sync disconnect
-            # This is best-effort - the client may not cleanly disconnect
-            if _current_client.is_connected():
-                _current_client.disconnect()
-                print("Client disconnected.")
-        except Exception:
-            pass
+    def handle_signal():
+        """Signal handler that sets the shutdown event."""
+        print("\n\nInterrupted! Cleaning up...")
+        if _shutdown_event is not None:
+            _shutdown_event.set()
 
-    # Save and close database
-    if _current_db is not None:
-        try:
-            _current_db.commit()
-            _current_db.close()
-            print("Database saved and closed.")
-        except Exception:
-            pass
+    try:
+        loop = asyncio.get_running_loop()
+        # Use asyncio signal handling for proper async cleanup
+        loop.add_signal_handler(signal.SIGINT, handle_signal)
+        loop.add_signal_handler(signal.SIGTERM, handle_signal)
+    except (RuntimeError, NotImplementedError):
+        # Fallback for platforms that don't support loop.add_signal_handler (Windows)
+        # This is less ideal but still functional
+        pass
 
-    sys.exit(130)
+
+async def run_with_graceful_shutdown(coro):
+    """Run a coroutine with proper graceful shutdown handling.
+
+    Sets up signal handlers and ensures cleanup happens properly.
+    """
+    global _shutdown_event
+    _shutdown_event = asyncio.Event()
+    _setup_signal_handlers()
+
+    try:
+        return await coro
+    except asyncio.CancelledError:
+        print("Operation cancelled.")
+        raise
+    finally:
+        # Proper async cleanup
+        if _current_client is not None:
+            try:
+                if _current_client.is_connected():
+                    await _current_client.disconnect()
+                    print("Client disconnected.")
+            except Exception as e:
+                logger.debug(f"Error disconnecting client: {e}")
+
+        if _current_db is not None:
+            try:
+                _current_db.commit()
+                _current_db.close()
+                print("Database saved and closed.")
+            except Exception as e:
+                logger.debug(f"Error closing database: {e}")
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -55,6 +83,19 @@ def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="tgx",
         description="Personal Telegram archiver/exporter CLI",
+    )
+
+    # Global verbosity options
+    verbosity = parser.add_mutually_exclusive_group()
+    verbosity.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Enable verbose output (debug logging)",
+    )
+    verbosity.add_argument(
+        "-q", "--quiet",
+        action="store_true",
+        help="Quiet mode (only errors and essential output)",
     )
 
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
@@ -191,22 +232,45 @@ def create_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def setup_logging(verbose: bool = False, quiet: bool = False) -> None:
+    """Configure logging based on verbosity flags.
+
+    Args:
+        verbose: Enable debug-level logging
+        quiet: Only show errors and essential output
+    """
+    if verbose:
+        level = logging.DEBUG
+        fmt = "%(levelname)s [%(name)s] %(message)s"
+    elif quiet:
+        level = logging.ERROR
+        fmt = "%(message)s"
+    else:
+        level = logging.INFO
+        fmt = "%(levelname)s: %(message)s"
+
+    logging.basicConfig(level=level, format=fmt, force=True)
+
+    # Suppress noisy third-party loggers in non-verbose mode
+    if not verbose:
+        logging.getLogger("telethon").setLevel(logging.WARNING)
+
+
 def main() -> int:
     """Main entry point."""
     # Load .env file if present (before accessing any config)
     load_dotenv()
 
-    # Set up basic logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(levelname)s: %(message)s",
-    )
-
-    # Set up signal handler for graceful shutdown
-    signal.signal(signal.SIGINT, _signal_handler)
-
     parser = create_parser()
     args = parser.parse_args()
+
+    # Set up logging based on verbosity flags
+    setup_logging(
+        verbose=getattr(args, 'verbose', False),
+        quiet=getattr(args, 'quiet', False)
+    )
+
+    # Note: Signal handling is now done in async context via run_with_graceful_shutdown
 
     if args.command is None:
         parser.print_help()
@@ -222,10 +286,12 @@ def main() -> int:
         return asyncio.run(fetch_test(peer_input=args.peer, limit=args.limit))
 
     if args.command == "sync":
-        return asyncio.run(run_sync(peer_input=args.peer, target_count=args.last))
+        return asyncio.run(run_with_graceful_shutdown(
+            run_sync(peer_input=args.peer, target_count=args.last)
+        ))
 
     if args.command == "export":
-        return asyncio.run(run_export(
+        return asyncio.run(run_with_graceful_shutdown(run_export(
             peer_input=args.peer,
             last_n=args.last,
             start_date=args.start,
@@ -236,16 +302,17 @@ def main() -> int:
             jsonl_path=args.jsonl,
             include_raw=args.include_raw,
             raw_as_string=args.raw_as_string,
-        ))
+        )))
 
     return 0
 
 
-def parse_local_datetime(date_str: str | None) -> datetime | None:
+def parse_local_datetime(date_str: str | None, is_end: bool = False) -> datetime | None:
     """Parse a local datetime string to UTC.
 
     Args:
         date_str: Date string (YYYY-MM-DD or YYYY-MM-DD HH:MM:SS)
+        is_end: If True and date-only format, set time to end of day (23:59:59.999999)
 
     Returns:
         UTC datetime or None
@@ -253,11 +320,13 @@ def parse_local_datetime(date_str: str | None) -> datetime | None:
     if not date_str:
         return None
 
-
     # Try parsing with time
     for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"]:
         try:
             dt = datetime.strptime(date_str, fmt)
+            # For date-only format with is_end=True, set to end of day
+            if fmt == "%Y-%m-%d" and is_end:
+                dt = dt.replace(hour=23, minute=59, second=59, microsecond=999999)
             # Assume local timezone, convert to UTC
             local_dt = dt.astimezone()  # Add local TZ info
             utc_dt = local_dt.astimezone(timezone.utc)
@@ -291,18 +360,30 @@ async def run_export(
         print("Error: At least one output format required (--txt or --jsonl)")
         return 1
 
-    # Parse dates
+    # Validate mutual exclusivity of --last with date/ID filters
+    if last_n is not None and any([start_date, end_date, since_id, until_id]):
+        print("Error: --last cannot be combined with date/ID filters (--start, --end, --since-id, --until-id)")
+        return 1
+
+    # Parse dates (end date uses end-of-day semantics for date-only input)
     try:
-        start_dt = parse_local_datetime(start_date)
-        end_dt = parse_local_datetime(end_date)
+        start_dt = parse_local_datetime(start_date, is_end=False)
+        end_dt = parse_local_datetime(end_date, is_end=True)
     except ValueError as e:
         print(f"Error: {e}")
         return 1
 
     # Determine target count for sync
-    # If --last is specified, sync at least that many
-    # Otherwise sync a reasonable default
-    target_count = last_n if last_n else 1000
+    # - With --last: sync exactly that many
+    # - With date/ID filters (start_date, since_id): sync only until boundary (no minimum)
+    # - No filters: sync a reasonable default (1000)
+    if last_n is not None:
+        target_count = last_n
+    elif start_date or since_id:
+        # Date/ID filters specified - sync until boundary, no minimum count
+        target_count = 0
+    else:
+        target_count = 1000
 
     client = create_client()
     db = Database()
@@ -312,10 +393,13 @@ async def run_export(
     try:
         await ensure_authorized(client)
 
+        # Normalize peer input (handle t.me links, etc.)
+        normalized_peer = normalize_peer_input(peer_input)
+
         # Step 1: Resolve peer to get peer_id
         print(f"Resolving peer: {peer_input}...")
         try:
-            input_entity = await client.get_input_entity(peer_input)
+            input_entity = await client.get_input_entity(normalized_peer)
             entity = await client.get_entity(input_entity)
         except ValueError:
             print(f"Error: Could not find entity '{peer_input}'")
@@ -325,13 +409,17 @@ async def run_export(
         title = get_display_name(entity)
         print(f"Resolved: {title} (peer_id: {peer_id})")
 
-        # Step 2: Sync
+        # Step 2: Sync (with boundary-aware backfill for date/ID filters)
+        # Pass resolved entity to avoid double resolution
         print("\n--- Syncing ---")
         await sync_peer(
             client=client,
             db=db,
-            peer_input=peer_input,
             target_count=target_count,
+            min_date=start_dt,   # Backfill until we have messages at this date
+            min_id=since_id,     # Or until we have messages at this ID
+            entity=entity,
+            peer_id=peer_id,
         )
 
         # Step 3: Export from DB
@@ -356,9 +444,7 @@ async def run_export(
     except ValueError as e:
         print(f"Error: {e}")
         return 1
-    finally:
-        await client.disconnect()
-        db.close()
+    # Note: Cleanup is handled by run_with_graceful_shutdown
 
 
 async def run_sync(peer_input: str, target_count: int) -> int:
@@ -381,10 +467,13 @@ async def run_sync(peer_input: str, target_count: int) -> int:
     try:
         await ensure_authorized(client)
 
+        # Normalize peer input (handle t.me links, etc.)
+        normalized_peer = normalize_peer_input(peer_input)
+
         await sync_peer(
             client=client,
             db=db,
-            peer_input=peer_input,
+            peer_input=normalized_peer,
             target_count=target_count,
         )
 
@@ -392,9 +481,7 @@ async def run_sync(peer_input: str, target_count: int) -> int:
     except ValueError as e:
         print(f"Error: {e}")
         return 1
-    finally:
-        await client.disconnect()
-        db.close()
+    # Note: Cleanup is handled by run_with_graceful_shutdown
 
 
 if __name__ == "__main__":

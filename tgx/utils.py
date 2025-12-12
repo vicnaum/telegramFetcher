@@ -1,6 +1,50 @@
 """Utility functions for tgx."""
 
+import re
+
 from telethon import utils as tl_utils
+
+
+def normalize_peer_input(peer_input: str) -> str | int:
+    """Normalize peer input to username or int ID.
+
+    Handles various input formats:
+    - https://t.me/username -> @username
+    - t.me/username -> @username
+    - @username -> @username (unchanged)
+    - username -> @username
+    - -1001234567890 -> -1001234567890 (int)
+    - 1234567890 -> 1234567890 (int)
+
+    Args:
+        peer_input: Raw peer identifier from user
+
+    Returns:
+        Normalized username (str with @) or peer ID (int)
+    """
+    peer_input = peer_input.strip()
+
+    # Handle t.me links (various formats)
+    if "t.me/" in peer_input:
+        # Match: t.me/username, t.me/+invite, t.me/joinchat/hash
+        match = re.search(r't\.me/(?:\+|joinchat/)?([a-zA-Z][\w]+)', peer_input)
+        if match:
+            return f"@{match.group(1)}"
+        # If we can't parse it, return as-is and let Telethon try
+        return peer_input
+
+    # Already has @ prefix
+    if peer_input.startswith("@"):
+        return peer_input
+
+    # Try parsing as integer (peer ID)
+    try:
+        return int(peer_input)
+    except ValueError:
+        pass
+
+    # Assume it's a username without @ prefix
+    return f"@{peer_input}"
 
 
 def get_display_name(entity) -> str:
@@ -53,23 +97,17 @@ def truncate_text(text: str | None, max_len: int = 50) -> str:
 
 
 def flatten_text(text: str | None) -> str:
-    """Flatten text by replacing newlines with spaces.
+    """Flatten text by replacing newlines with spaces and collapsing whitespace.
 
     Args:
         text: Text to flatten
 
     Returns:
-        Flattened text
+        Flattened text with normalized whitespace
     """
     if not text:
         return ""
 
-    # Replace CR/LF with spaces, collapse multiple spaces
-    text = text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
-
-    # Collapse multiple spaces
-    while "  " in text:
-        text = text.replace("  ", " ")
-
-    return text.strip()
+    # split() handles all whitespace (spaces, tabs, newlines) and collapses multiple
+    return " ".join(text.split())
 
