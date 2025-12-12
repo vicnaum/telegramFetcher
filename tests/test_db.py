@@ -444,3 +444,112 @@ class TestContextManager:
             rows = list(db.get_messages(123))
             assert len(rows) == 1
 
+
+class TestExportFilterValidation:
+    """Test export filter validation."""
+
+    def test_last_n_positive_required(self, db):
+        """last_n must be positive."""
+        with pytest.raises(ValueError, match="must be positive"):
+            db._validate_export_filters(
+                last_n=0,
+                since_id=None,
+                until_id=None,
+                start_date=None,
+                end_date=None,
+            )
+
+        with pytest.raises(ValueError, match="must be positive"):
+            db._validate_export_filters(
+                last_n=-5,
+                since_id=None,
+                until_id=None,
+                start_date=None,
+                end_date=None,
+            )
+
+    def test_last_n_cannot_combine_with_other_filters(self, db):
+        """last_n cannot be combined with other filters."""
+        with pytest.raises(ValueError, match="cannot be combined"):
+            db._validate_export_filters(
+                last_n=10,
+                since_id=5,
+                until_id=None,
+                start_date=None,
+                end_date=None,
+            )
+
+    def test_since_id_must_be_less_than_until_id(self, db):
+        """since_id must be less than until_id."""
+        with pytest.raises(ValueError, match="must be less than until_id"):
+            db._validate_export_filters(
+                last_n=None,
+                since_id=100,
+                until_id=50,
+                start_date=None,
+                end_date=None,
+            )
+
+        with pytest.raises(ValueError, match="must be less than until_id"):
+            db._validate_export_filters(
+                last_n=None,
+                since_id=100,
+                until_id=100,  # Equal is also invalid
+                start_date=None,
+                end_date=None,
+            )
+
+    def test_start_date_must_not_be_after_end_date(self, db):
+        """start_date must not be after end_date."""
+        start = datetime(2025, 1, 20, 0, 0, 0, tzinfo=timezone.utc)
+        end = datetime(2025, 1, 10, 0, 0, 0, tzinfo=timezone.utc)
+
+        with pytest.raises(ValueError, match="must not be after end_date"):
+            db._validate_export_filters(
+                last_n=None,
+                since_id=None,
+                until_id=None,
+                start_date=start,
+                end_date=end,
+            )
+
+    def test_valid_filters_pass(self, db):
+        """Valid filter combinations should not raise."""
+        # last_n alone
+        db._validate_export_filters(
+            last_n=10,
+            since_id=None,
+            until_id=None,
+            start_date=None,
+            end_date=None,
+        )
+
+        # Valid ID range
+        db._validate_export_filters(
+            last_n=None,
+            since_id=10,
+            until_id=100,
+            start_date=None,
+            end_date=None,
+        )
+
+        # Valid date range
+        start = datetime(2025, 1, 10, 0, 0, 0, tzinfo=timezone.utc)
+        end = datetime(2025, 1, 20, 0, 0, 0, tzinfo=timezone.utc)
+        db._validate_export_filters(
+            last_n=None,
+            since_id=None,
+            until_id=None,
+            start_date=start,
+            end_date=end,
+        )
+
+        # No filters at all
+        db._validate_export_filters(
+            last_n=None,
+            since_id=None,
+            until_id=None,
+            start_date=None,
+            end_date=None,
+        )
+

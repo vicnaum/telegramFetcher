@@ -59,17 +59,22 @@ class TestNormalizePeerInput:
         assert normalize_peer_input("telegram.me/telegram") == "@telegram"
 
     # Private channel links (t.me/c/...)
-    def test_tme_private_channel_passthrough(self):
-        """t.me/c/123456789/123 should be passed through."""
+    def test_tme_private_channel_to_peer_id(self):
+        """t.me/c/123456789/123 should be converted to peer ID."""
         result = normalize_peer_input("https://t.me/c/1234567890/456")
-        # Should pass through the original URL, not transform to @c
-        assert result == "https://t.me/c/1234567890/456"
+        # Should convert to peer_id format: -100 prefix for channels
+        assert result == -1001234567890
 
     def test_tme_private_channel_no_protocol(self):
-        """t.me/c/... without protocol should be passed through."""
+        """t.me/c/... without protocol should be converted to peer ID."""
         result = normalize_peer_input("t.me/c/1234567890/456")
-        # Should pass through
-        assert "t.me/c/" in result
+        # Should convert to peer_id
+        assert result == -1001234567890
+
+    def test_tme_private_channel_no_message_id(self):
+        """t.me/c/123456789 without message ID should still work."""
+        result = normalize_peer_input("t.me/c/1234567890")
+        assert result == -1001234567890
 
     # Invite links
     def test_tme_invite_plus(self):

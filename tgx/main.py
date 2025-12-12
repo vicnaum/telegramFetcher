@@ -81,24 +81,14 @@ async def _cleanup_resources() -> None:
         finally:
             _current_client = None
 
-    # Commit and close database (critical - use shield)
+    # Commit and close database (must be on same thread as connection was created)
     if _current_db is not None:
         try:
-            # Shield the final commit so it completes even during cancellation
-            await asyncio.shield(asyncio.to_thread(_current_db.commit))
+            _current_db.commit()
             _current_db.close()
             print("Database saved and closed.")
-        except asyncio.CancelledError:
-            # Re-try commit synchronously if shield was bypassed
-            try:
-                _current_db.commit()
-                _current_db.close()
-                print("Database saved and closed (sync fallback).")
-            except Exception as e:
-                logger.error(f"Failed to save database: {e}")
-            raise
         except Exception as e:
-            logger.debug(f"Error closing database: {e}")
+            logger.error(f"Error closing database: {e}")
         finally:
             _current_db = None
 
@@ -259,6 +249,11 @@ def create_parser() -> argparse.ArgumentParser:
         default=100,
         help="Target number of messages to have in DB (default: 100)",
     )
+    sync_parser.add_argument(
+        "--no-store-raw",
+        action="store_true",
+        help="Don't store raw JSON for each message (reduces DB size)",
+    )
 
     # export command
     export_parser = subparsers.add_parser(
@@ -329,6 +324,11 @@ def create_parser() -> argparse.ArgumentParser:
         "--raw-as-string",
         action="store_true",
         help="Emit raw_data as JSON string instead of parsed object (for debugging)",
+    )
+    export_parser.add_argument(
+        "--no-store-raw",
+        action="store_true",
+        help="Don't store raw JSON for new messages during sync (reduces DB size)",
     )
 
     return parser
@@ -424,7 +424,11 @@ def main() -> int:
         # Commands that need graceful shutdown (database operations)
         if args.command == "sync":
             return run_async_with_shutdown(
-                run_sync(peer_input=args.peer, target_count=args.last)
+                run_sync(
+                    peer_input=args.peer,
+                    target_count=args.last,
+                    store_raw=not args.no_store_raw,
+                )
             )
 
         if args.command == "export":
@@ -440,6 +444,7 @@ def main() -> int:
                 include_raw=args.include_raw,
                 raw_as_string=args.raw_as_string,
                 tz_name=args.tz,
+                store_raw=not args.no_store_raw,
             ))
 
     except ConfigurationError as e:
@@ -521,6 +526,7 @@ async def run_export(
     include_raw: bool,
     raw_as_string: bool = False,
     tz_name: str | None = None,
+    store_raw: bool = True,
 ) -> int:
     """Run export command (sync first, then export).
 
@@ -599,6 +605,7 @@ async def run_export(
             entity=entity,
             peer_id=peer_id,
             shutdown_event=_shutdown_event,
+            store_raw=store_raw,
         )
 
         # Check for shutdown before export
@@ -638,12 +645,13 @@ async def run_export(
     # Note: Cleanup is handled by run_with_graceful_shutdown
 
 
-async def run_sync(peer_input: str, target_count: int) -> int:
+async def run_sync(peer_input: str, target_count: int, store_raw: bool = True) -> int:
     """Run sync command.
 
     Args:
         peer_input: Peer identifier
         target_count: Target number of messages
+        store_raw: Whether to store raw JSON for each message
 
     Returns:
         Exit code
@@ -672,6 +680,7 @@ async def run_sync(peer_input: str, target_count: int) -> int:
             peer_input=normalized_peer,
             target_count=target_count,
             shutdown_event=_shutdown_event,
+            store_raw=store_raw,
         )
 
         return 0

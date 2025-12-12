@@ -46,8 +46,8 @@ def epoch_ms_to_datetime(epoch_ms: int) -> datetime:
 class Database:
     """SQLite database wrapper for message storage."""
 
-    # Current schema version - increment when adding migrations
-    SCHEMA_VERSION = 2
+    # Current schema version - equals the highest implemented migration number
+    SCHEMA_VERSION = 1
 
     def __init__(self, db_path: str | None = None):
         """Initialize database connection.
@@ -155,17 +155,15 @@ class Database:
             self._set_schema_version(1)
             current_version = 1
 
-        # Migration 2: (placeholder for future migrations)
-        # Example of how to add future migrations:
+        # Future migrations go here:
         # if current_version < 2:
         #     self.conn.execute("ALTER TABLE messages ADD COLUMN new_field TEXT")
         #     self.conn.commit()
         #     self._set_schema_version(2)
         #     current_version = 2
-
-        # Ensure we're at the current version
-        if current_version < self.SCHEMA_VERSION:
-            self._set_schema_version(self.SCHEMA_VERSION)
+        #
+        # Note: Only bump SCHEMA_VERSION when adding a new migration.
+        # The version should equal the highest implemented migration number.
 
     def __enter__(self) -> "Database":
         """Context manager entry."""
@@ -368,6 +366,9 @@ class Database:
     ) -> bool:
         """Insert a message (ignores duplicates only).
 
+        Uses INSERT OR IGNORE for robust duplicate handling that doesn't
+        depend on exception text parsing.
+
         Args:
             msg_id: Message ID
             peer_id: Peer ID
@@ -385,31 +386,24 @@ class Database:
 
         Raises:
             ValueError: If date is None
-            sqlite3.IntegrityError: For non-duplicate constraint violations
+            sqlite3.IntegrityError: For FK violations (peer_id not in peers table)
         """
         if date is None:
             raise ValueError(f"Message {msg_id} has no date - cannot insert")
 
         date_ms = datetime_to_epoch_ms(date)
 
-        try:
-            cursor = self.conn.execute("""
-                INSERT INTO messages
-                (id, peer_id, date_utc_ms, sender_id, sender_name, text,
-                 reply_to_msg_id, has_media, media_type, raw_data)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                msg_id, peer_id, date_ms,
-                sender_id, sender_name, text, reply_to_msg_id,
-                1 if has_media else 0, media_type, raw_data
-            ))
-            return cursor.rowcount == 1
-        except sqlite3.IntegrityError as e:
-            # Check if it's a primary key (duplicate) error
-            if "UNIQUE constraint failed" in str(e) or "PRIMARY KEY" in str(e):
-                return False
-            # Re-raise other integrity errors (FK violations, etc.)
-            raise
+        cursor = self.conn.execute("""
+            INSERT OR IGNORE INTO messages
+            (id, peer_id, date_utc_ms, sender_id, sender_name, text,
+             reply_to_msg_id, has_media, media_type, raw_data)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            msg_id, peer_id, date_ms,
+            sender_id, sender_name, text, reply_to_msg_id,
+            1 if has_media else 0, media_type, raw_data
+        ))
+        return cursor.rowcount == 1
 
     def insert_messages_batch(self, messages: list[dict]) -> int:
         """Insert multiple messages in a batch using executemany.
@@ -540,7 +534,7 @@ class Database:
         start_date: datetime | None,
         end_date: datetime | None,
     ) -> None:
-        """Validate that export filter parameters are not conflicting.
+        """Validate that export filter parameters are valid and not conflicting.
 
         Args:
             last_n: Get last N messages
@@ -550,9 +544,12 @@ class Database:
             end_date: End datetime (inclusive, UTC)
 
         Raises:
-            ValueError: If last_n is combined with other filters
+            ValueError: If parameters are invalid or conflicting
         """
         if last_n is not None:
+            if last_n <= 0:
+                raise ValueError("last_n must be positive")
+
             other_filters = [since_id, until_id, start_date, end_date]
             if any(f is not None for f in other_filters):
                 raise ValueError(
@@ -560,6 +557,16 @@ class Database:
                     "(since_id, until_id, start_date, end_date). "
                     "Use either last_n OR the other filters, not both."
                 )
+
+        if since_id is not None and until_id is not None and since_id >= until_id:
+            raise ValueError(
+                f"since_id ({since_id}) must be less than until_id ({until_id})"
+            )
+
+        if start_date is not None and end_date is not None and start_date > end_date:
+            raise ValueError(
+                f"start_date ({start_date}) must not be after end_date ({end_date})"
+            )
 
     def get_messages_for_export(
         self,

@@ -127,14 +127,14 @@ async def qr_login(client: TelegramClient, timeout: int = 120) -> bool:
     print("3. Scan the QR code below")
     print("=" * 40 + "\n")
 
-    start_time = asyncio.get_event_loop().time()
+    start_time = asyncio.get_running_loop().time()
 
     try:
         qr_login_obj = await client.qr_login()
 
         while True:
             # Check total timeout
-            elapsed = asyncio.get_event_loop().time() - start_time
+            elapsed = asyncio.get_running_loop().time() - start_time
             remaining = timeout - elapsed
             if remaining <= 0:
                 print(f"\n⏰ QR code login timed out after {timeout}s")
@@ -163,7 +163,7 @@ async def qr_login(client: TelegramClient, timeout: int = 120) -> bool:
                 return True
             except asyncio.TimeoutError:
                 # Check if total timeout exceeded
-                elapsed = asyncio.get_event_loop().time() - start_time
+                elapsed = asyncio.get_running_loop().time() - start_time
                 if elapsed >= timeout:
                     print(f"\n⏰ QR code login timed out after {timeout}s")
                     return False

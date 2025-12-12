@@ -57,9 +57,15 @@ def normalize_peer_input(peer_input: str) -> str | int:
 
         # Private channel links: t.me/c/123456789/123
         # The "c" indicates a private channel with numeric ID
-        if first_segment == "c":
-            # Return the original - Telethon can resolve these
-            return peer_input
+        # Convert to peer_id format: -100 prefix for channels
+        if first_segment == "c" and len(segments) >= 2:
+            try:
+                internal_id = int(segments[1])
+                # Telegram channel IDs use -100 prefix
+                return -1000000000000 - internal_id
+            except ValueError:
+                # Not a valid numeric ID, pass through
+                return peer_input
 
         # Public username links: t.me/username or t.me/username/123
         # Validate that it looks like a username (starts with letter, alphanumeric + underscore)

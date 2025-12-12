@@ -13,6 +13,23 @@ from tgx.utils import get_display_name, get_peer_id
 
 logger = logging.getLogger(__name__)
 
+# Retry configuration
+MAX_RETRIES = 5
+INITIAL_BACKOFF = 5  # seconds
+MAX_BACKOFF = 300  # 5 minutes cap
+
+
+def _calculate_backoff(retry_count: int) -> float:
+    """Calculate exponential backoff delay.
+
+    Args:
+        retry_count: Number of retries so far (0-indexed)
+
+    Returns:
+        Delay in seconds, capped at MAX_BACKOFF
+    """
+    return min(INITIAL_BACKOFF * (2 ** retry_count), MAX_BACKOFF)
+
 
 def classify_peer_type(entity) -> str:
     """Classify the peer type based on Telethon entity class.
@@ -72,12 +89,23 @@ def get_media_type(msg) -> str | None:
     return "other"
 
 
-async def get_sender_name(msg, sender_cache: dict[int, str | None]) -> str | None:
+async def get_sender_name(
+    msg,
+    sender_cache: dict[int, str | None],
+    peer_title: str | None = None,
+) -> str | None:
     """Get sender name, resolving if needed and using cache.
+
+    Handles multiple sender attribution sources:
+    1. sender_id -> resolve to user/chat name (cached)
+    2. post_author -> channel post signature
+    3. sender_chat -> anonymous admin or linked channel
+    4. peer_title -> fallback for channel posts with no attribution
 
     Args:
         msg: Telethon Message object
         sender_cache: Cache mapping sender_id -> sender_name
+        peer_title: Fallback title for channel posts (optional)
 
     Returns:
         Sender name or None
@@ -87,60 +115,81 @@ async def get_sender_name(msg, sender_cache: dict[int, str | None]) -> str | Non
         Transient errors (FloodWait, network issues) are not cached
         to allow retry on subsequent messages.
     """
-    if msg.sender_id is None:
-        return None
+    # Case 1: Message has a sender_id (most common)
+    if msg.sender_id is not None:
+        # Check cache first
+        if msg.sender_id in sender_cache:
+            return sender_cache[msg.sender_id]
 
-    # Check cache first
-    if msg.sender_id in sender_cache:
-        return sender_cache[msg.sender_id]
-
-    # Try to get from message's sender attribute
-    sender = msg.sender
-    if sender is None:
-        # Resolve sender via API call
-        try:
-            sender = await msg.get_sender()
-        except FloodWaitError:
-            # Transient error - don't cache, let caller handle
-            logger.debug(f"FloodWait while resolving sender {msg.sender_id}")
-            return None
-        except ChannelPrivateError:
-            # Permanent error - sender is in a private channel we can't access
-            sender_cache[msg.sender_id] = None
-            return None
-        except RPCError as e:
-            # Check if it's a permanent error (user not found, etc.)
-            error_msg = str(e).lower()
-            if "user" in error_msg and ("invalid" in error_msg or "not found" in error_msg):
-                # Permanent - user doesn't exist
+        # Try to get from message's sender attribute
+        sender = msg.sender
+        if sender is None:
+            # Resolve sender via API call
+            try:
+                sender = await msg.get_sender()
+            except FloodWaitError:
+                # Transient error - don't cache, let caller handle
+                logger.debug(f"FloodWait while resolving sender {msg.sender_id}")
+                return None
+            except ChannelPrivateError:
+                # Permanent error - sender is in a private channel we can't access
                 sender_cache[msg.sender_id] = None
                 return None
-            # Other RPC errors might be transient - don't cache
-            logger.debug(f"RPC error while resolving sender {msg.sender_id}: {e}")
-            return None
-        except (OSError, ConnectionError):
-            # Network errors are transient - don't cache
-            logger.debug(f"Network error while resolving sender {msg.sender_id}")
-            return None
+            except RPCError as e:
+                # Check if it's a permanent error (user not found, etc.)
+                error_msg = str(e).lower()
+                if "user" in error_msg and ("invalid" in error_msg or "not found" in error_msg):
+                    # Permanent - user doesn't exist
+                    sender_cache[msg.sender_id] = None
+                    return None
+                # Other RPC errors might be transient - don't cache
+                logger.debug(f"RPC error while resolving sender {msg.sender_id}: {e}")
+                return None
+            except (OSError, ConnectionError):
+                # Network errors are transient - don't cache
+                logger.debug(f"Network error while resolving sender {msg.sender_id}")
+                return None
 
-    # Get display name and cache
-    name = get_display_name(sender) if sender else None
-    sender_cache[msg.sender_id] = name
-    return name
+        # Get display name and cache
+        name = get_display_name(sender) if sender else None
+        sender_cache[msg.sender_id] = name
+        return name
+
+    # Case 2: Channel post with signature (post_author)
+    if hasattr(msg, "post_author") and msg.post_author:
+        return msg.post_author
+
+    # Case 3: Anonymous admin or linked channel (sender_chat)
+    if hasattr(msg, "sender_chat") and msg.sender_chat:
+        return get_display_name(msg.sender_chat)
+
+    # Case 4: Fallback to peer title for channel posts
+    if peer_title:
+        return peer_title
+
+    return None
 
 
-async def message_to_dict(msg, peer_id: int, sender_cache: dict[int, str | None]) -> dict:
+async def message_to_dict(
+    msg,
+    peer_id: int,
+    sender_cache: dict[int, str | None],
+    peer_title: str | None = None,
+    store_raw: bool = True,
+) -> dict:
     """Convert a Telethon Message to a dict for database insertion.
 
     Args:
         msg: Telethon Message object
         peer_id: Peer ID
         sender_cache: Cache mapping sender_id -> sender_name
+        peer_title: Peer title for fallback sender attribution
+        store_raw: Whether to store raw JSON (default True)
 
     Returns:
         Dict ready for db.insert_messages_batch
     """
-    sender_name = await get_sender_name(msg, sender_cache)
+    sender_name = await get_sender_name(msg, sender_cache, peer_title)
 
     reply_to_msg_id = None
     if msg.reply_to:
@@ -156,7 +205,7 @@ async def message_to_dict(msg, peer_id: int, sender_cache: dict[int, str | None]
         "reply_to_msg_id": reply_to_msg_id,
         "has_media": bool(msg.media),
         "media_type": get_media_type(msg),
-        "raw_data": msg.to_json(),
+        "raw_data": msg.to_json() if store_raw else None,
     }
 
 
@@ -196,6 +245,7 @@ async def sync_peer(
     entity=None,
     peer_id: int | None = None,
     shutdown_event: asyncio.Event | None = None,
+    store_raw: bool = True,
 ) -> dict:
     """Sync messages from a peer to the database.
 
@@ -219,6 +269,7 @@ async def sync_peer(
         entity: Pre-resolved Telethon entity (optional, avoids extra API call)
         peer_id: Pre-resolved peer ID (optional, used with entity)
         shutdown_event: Optional event to signal graceful shutdown
+        store_raw: Whether to store raw JSON for each message (default True)
 
     Returns:
         Dict with sync stats: inserted, peer_id, min_id, max_id
@@ -248,8 +299,18 @@ async def sync_peer(
 
     logger.info(f"Syncing: {title} (peer_id: {peer_id})")
 
-    # Get current boundaries from peers table (for resume logic)
+    # Get current boundaries - reconcile peers table with actual message data
+    # This ensures crash-safe resume: if interrupted after commit but before
+    # peers table update, we use the actual message boundaries
     db_min_id, db_max_id = db.get_sync_boundaries(peer_id)
+    actual_min, actual_max = db.get_actual_message_boundaries(peer_id)
+
+    # Use the better of the two sources
+    if actual_min > 0:
+        db_min_id = min(db_min_id, actual_min) if db_min_id > 0 else actual_min
+    if actual_max > 0:
+        db_max_id = max(db_max_id, actual_max)
+
     logger.info(f"DB boundaries: min_id={db_min_id}, max_id={db_max_id}")
 
     # Stats tracking - use a dict so _flush_batch can update it
@@ -267,6 +328,7 @@ async def sync_peer(
     if db_max_id > 0:
         logger.info(f"Phase 1: Tail sync (messages newer than {db_max_id})...")
         tail_count = 0
+        retry_count = 0
 
         # last_committed_id: only advance after successful commit
         # This is the resume point if we get interrupted
@@ -290,7 +352,7 @@ async def sync_peer(
                     reverse=True,  # Fetch oldest -> newest
                     wait_time=1,   # Be nice to Telegram
                 ):
-                    batch.append(await message_to_dict(msg, peer_id, sender_cache))
+                    batch.append(await message_to_dict(msg, peer_id, sender_cache, title, store_raw))
 
                     if len(batch) >= batch_size:
                         inserted = _flush_batch(db, batch, stats)
@@ -311,7 +373,8 @@ async def sync_peer(
                     logger.info(f"Committed batch: {inserted} messages")
                     batch = []
 
-                # Completed iteration successfully
+                # Completed iteration successfully - reset retry count
+                retry_count = 0
                 break
 
             except FloodWaitError as e:
@@ -323,9 +386,10 @@ async def sync_peer(
                     logger.info(f"Flushed {inserted} messages before rate limit sleep")
                     batch = []
 
+                # FloodWait is handled by Telegram's specified wait time
                 logger.warning(f"Rate limited! Sleeping {e.seconds}s...")
                 await asyncio.sleep(e.seconds)
-                # Continue from last_committed_id
+                # Continue from last_committed_id (don't count as retry)
                 continue
             except ChannelPrivateError:
                 raise ValueError("Channel became private or you were kicked/banned.") from None
@@ -338,9 +402,14 @@ async def sync_peer(
                     logger.info(f"Flushed {inserted} messages before retry")
                     batch = []
 
-                logger.warning(f"RPC error: {e}. Retrying after 5s...")
-                await asyncio.sleep(5)
-                # Continue from last_committed_id
+                retry_count += 1
+                if retry_count > MAX_RETRIES:
+                    logger.error(f"Max retries ({MAX_RETRIES}) exceeded in tail sync. Last error: {e}")
+                    break  # Exit phase with partial results
+
+                backoff = _calculate_backoff(retry_count - 1)
+                logger.warning(f"RPC error: {e}. Retry {retry_count}/{MAX_RETRIES} after {backoff}s...")
+                await asyncio.sleep(backoff)
                 continue
 
         logger.info(f"Tail sync complete: {tail_count} new messages")
@@ -374,6 +443,7 @@ async def sync_peer(
                 logger.info("Phase 2: Backfill (syncing until date/ID boundary)...")
 
             backfill_count = 0
+            retry_count = 0
 
             # Get the actual lowest message ID from DB to use as resume point
             # This is more reliable than tracking in-memory
@@ -426,7 +496,7 @@ async def sync_peer(
                     lowest_id_in_batch: int | None = None
 
                     async for msg in client.iter_messages(**iter_kwargs):
-                        batch.append(await message_to_dict(msg, peer_id, sender_cache))
+                        batch.append(await message_to_dict(msg, peer_id, sender_cache, title, store_raw))
                         batch_fetched += 1
 
                         # Track lowest ID in current batch for resume
@@ -461,6 +531,9 @@ async def sync_peer(
                         logger.info("Reached beginning of chat history")
                         break
 
+                    # Successful iteration - reset retry count
+                    retry_count = 0
+
                 except FloodWaitError as e:
                     # Flush partial batch before sleeping
                     if batch:
@@ -473,6 +546,7 @@ async def sync_peer(
                         logger.info(f"Flushed {inserted} messages before rate limit sleep")
                         batch = []
 
+                    # FloodWait is handled by Telegram's specified wait time
                     logger.warning(f"Rate limited! Sleeping {e.seconds}s...")
                     await asyncio.sleep(e.seconds)
                     continue
@@ -489,8 +563,14 @@ async def sync_peer(
                         logger.info(f"Flushed {inserted} messages before retry")
                         batch = []
 
-                    logger.warning(f"RPC error: {e}. Retrying after 5s...")
-                    await asyncio.sleep(5)
+                    retry_count += 1
+                    if retry_count > MAX_RETRIES:
+                        logger.error(f"Max retries ({MAX_RETRIES}) exceeded in backfill. Last error: {e}")
+                        break  # Exit phase with partial results
+
+                    backoff = _calculate_backoff(retry_count - 1)
+                    logger.warning(f"RPC error: {e}. Retry {retry_count}/{MAX_RETRIES} after {backoff}s...")
+                    await asyncio.sleep(backoff)
                     continue
 
             logger.info(f"Backfill complete: {backfill_count} messages")

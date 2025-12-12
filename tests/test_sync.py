@@ -3,13 +3,21 @@
 Focus on:
 - Peer type classification (User vs Chat vs Channel)
 - Media type detection
+- Retry/backoff logic
 """
 
 from unittest.mock import MagicMock
 
 from telethon.tl.types import Channel, Chat, User
 
-from tgx.sync import classify_peer_type, get_media_type
+from tgx.sync import (
+    classify_peer_type,
+    get_media_type,
+    _calculate_backoff,
+    MAX_RETRIES,
+    INITIAL_BACKOFF,
+    MAX_BACKOFF,
+)
 
 
 class TestClassifyPeerType:
@@ -167,3 +175,33 @@ class TestGetMediaType:
         msg.web_preview = None
 
         assert get_media_type(msg) == "other"
+
+
+class TestRetryBackoff:
+    """Test exponential backoff calculation."""
+
+    def test_initial_backoff(self):
+        """First retry should use INITIAL_BACKOFF."""
+        assert _calculate_backoff(0) == INITIAL_BACKOFF
+
+    def test_exponential_growth(self):
+        """Backoff should double with each retry."""
+        assert _calculate_backoff(0) == INITIAL_BACKOFF
+        assert _calculate_backoff(1) == INITIAL_BACKOFF * 2
+        assert _calculate_backoff(2) == INITIAL_BACKOFF * 4
+        assert _calculate_backoff(3) == INITIAL_BACKOFF * 8
+
+    def test_max_backoff_cap(self):
+        """Backoff should be capped at MAX_BACKOFF."""
+        # With INITIAL_BACKOFF=5 and MAX_BACKOFF=300:
+        # retry 6 would be 5 * 2^6 = 320, should be capped to 300
+        large_retry = 10
+        result = _calculate_backoff(large_retry)
+        assert result == MAX_BACKOFF
+        assert result <= MAX_BACKOFF
+
+    def test_constants_are_sensible(self):
+        """Verify the retry constants are sensible."""
+        assert MAX_RETRIES >= 1
+        assert INITIAL_BACKOFF > 0
+        assert MAX_BACKOFF > INITIAL_BACKOFF
