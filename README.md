@@ -5,9 +5,11 @@ A CLI tool to archive and export Telegram chat history from channels and groups 
 ## Features
 
 - **Login as yourself** via MTProto (Telethon) - no bot required
+- **QR code login** - scan with your phone, no phone number typing needed
 - **Incremental sync** - only fetches new messages on subsequent runs
 - **Local SQLite database** - messages cached locally, no re-fetching
-- **Export formats**: TXT (one message per line) and JSONL
+- **Export formats**: TXT (with message IDs and reply threading) and JSONL
+- **Date/ID range filtering** - export specific time periods or message ranges
 - **Rate limit handling** - automatic sleep on FloodWait errors
 - **Graceful shutdown** - Ctrl+C saves state safely
 
@@ -149,11 +151,13 @@ uv run python -m tgx.main sync --peer @channelname --last 100
 One message per line, optimized for AI/LLM consumption:
 
 ```
-2025-01-15 10:30:45 | Alice | Hey everyone, check out this news article!
-2025-01-15 10:31:02 | Bob | Interesting, thanks for sharing
-2025-01-15 10:32:15 | channel | [photo]
+[12345] 2025-01-15 10:30:45 | Alice | Hey everyone, check out this news article!
+[12346] 2025-01-15 10:31:02 | Bob | [reply to #12345 @Alice] Interesting, thanks for sharing
+[12347] 2025-01-15 10:32:15 | channel | [photo]
 ```
 
+- **Message ID** in brackets at the start `[12345]`
+- **Reply info** shows which message is being replied to and who wrote it `[reply to #12345 @Alice]`
 - Timestamps are in local timezone
 - Newlines in messages are flattened to spaces
 - Media messages show `[media_type]`
@@ -163,7 +167,7 @@ One message per line, optimized for AI/LLM consumption:
 One JSON object per line:
 
 ```json
-{"id": 123, "peer_id": -1001234567890, "date": "2025-01-15T09:30:45+00:00", "sender_id": 111, "sender_name": "Alice", "text": "Hello", "has_media": false, "media_type": null}
+{"id": 12345, "peer_id": -1001234567890, "date": "2025-01-15T09:30:45+00:00", "sender_id": 111, "sender_name": "Alice", "text": "Hello", "reply_to_msg_id": null, "has_media": false, "media_type": null}
 ```
 
 ## Peer Input Formats
