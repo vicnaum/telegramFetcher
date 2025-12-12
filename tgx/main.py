@@ -30,6 +30,47 @@ logger = logging.getLogger(__name__)
 # Shutdown timeout for task cancellation
 SHUTDOWN_TIMEOUT = 10.0
 
+# Telegram API constants
+MSGS_PER_REQUEST = 100  # Telegram's limit per GetHistory request
+REQUESTS_PER_MINUTE = 30  # Conservative estimate to avoid FloodWait
+
+
+def _format_duration(seconds: float) -> str:
+    """Format seconds into human-readable duration.
+
+    Args:
+        seconds: Duration in seconds
+
+    Returns:
+        Formatted string like "2h 30m" or "45m" or "30s"
+    """
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    elif seconds < 3600:
+        minutes = int(seconds / 60)
+        return f"{minutes}m"
+    else:
+        hours = int(seconds / 3600)
+        minutes = int((seconds % 3600) / 60)
+        if minutes > 0:
+            return f"{hours}h {minutes}m"
+        return f"{hours}h"
+
+
+def _estimate_sync_time(message_count: int) -> tuple[int, float]:
+    """Estimate sync time for a given message count.
+
+    Args:
+        message_count: Number of messages to fetch
+
+    Returns:
+        Tuple of (requests_needed, estimated_seconds)
+    """
+    requests_needed = (message_count + MSGS_PER_REQUEST - 1) // MSGS_PER_REQUEST
+    # Add 20% buffer for FloodWaits
+    minutes_needed = (requests_needed / REQUESTS_PER_MINUTE) * 1.2
+    return requests_needed, minutes_needed * 60
+
 # Global references for graceful shutdown
 _current_db: Database | None = None
 _current_client: TelegramClient | None = None
@@ -236,6 +277,18 @@ def create_parser() -> argparse.ArgumentParser:
         help="Number of messages to fetch (default: 5)",
     )
 
+    # stats command
+    stats_parser = subparsers.add_parser(
+        "stats",
+        help="Show chat statistics (total messages, date range, etc.)",
+    )
+    stats_parser.add_argument(
+        "--peer",
+        type=str,
+        required=True,
+        help="Peer identifier (@username, t.me link, or peer ID)",
+    )
+
     # sync command
     sync_parser = subparsers.add_parser(
         "sync",
@@ -425,6 +478,13 @@ def main() -> int:
                 logger.warning("\nInterrupted!")
                 return 130
 
+        if args.command == "stats":
+            try:
+                return asyncio.run(show_stats(peer_input=args.peer))
+            except KeyboardInterrupt:
+                logger.warning("\nInterrupted!")
+                return 130
+
         # Commands that need graceful shutdown (database operations)
         if args.command == "sync":
             return run_async_with_shutdown(
@@ -516,6 +576,154 @@ def parse_local_datetime(
             continue
 
     raise ValueError(f"Could not parse date: {date_str}. Use YYYY-MM-DD or YYYY-MM-DD HH:MM:SS")
+
+
+async def show_stats(peer_input: str) -> int:
+    """Show statistics for a chat.
+
+    Displays:
+    - Total message count in the chat (from Telegram)
+    - First and last message dates
+    - Messages per day estimate
+    - Local coverage (if any data synced)
+
+    Args:
+        peer_input: Peer identifier
+
+    Returns:
+        Exit code
+    """
+    from tgx.db import Database, epoch_ms_to_datetime
+
+    client = create_client()
+
+    try:
+        await ensure_authorized(client)
+
+        # Normalize and resolve peer
+        normalized_peer = normalize_peer_input(peer_input)
+
+        print(f"Fetching stats for {peer_input}...")
+        print()
+
+        try:
+            input_entity = await client.get_input_entity(normalized_peer)
+            entity = await client.get_entity(input_entity)
+        except ValueError:
+            print(f"Error: Could not find entity '{peer_input}'")
+            return 1
+
+        peer_id = get_peer_id(entity)
+        title = get_display_name(entity)
+
+        print(f"Chat: {title}")
+        print(f"Peer ID: {peer_id}")
+        print()
+
+        # Get total count and latest message
+        # iter_messages with limit=0 returns total count
+        async for msg in client.iter_messages(entity, limit=1):
+            latest_msg = msg
+            break
+        else:
+            print("No messages in this chat.")
+            return 0
+
+        # Get message count (Telethon provides this)
+        # We need to make a request that returns the total
+        messages = await client.get_messages(entity, limit=0)
+        total_count = messages.total if hasattr(messages, 'total') else None
+
+        # Get the first message (oldest)
+        first_msg = None
+        async for msg in client.iter_messages(entity, limit=1, reverse=True):
+            first_msg = msg
+            break
+
+        print("=== Telegram Stats ===")
+        if total_count:
+            print(f"Total messages: ~{total_count:,}")
+        print(f"Latest message ID: {latest_msg.id}")
+        print(f"Latest message date: {latest_msg.date.strftime('%Y-%m-%d %H:%M:%S')}")
+
+        if first_msg:
+            print(f"First message ID: {first_msg.id}")
+            print(f"First message date: {first_msg.date.strftime('%Y-%m-%d %H:%M:%S')}")
+
+            # Calculate chat age and message density
+            from datetime import datetime, timezone
+            chat_age = datetime.now(timezone.utc) - first_msg.date.replace(tzinfo=timezone.utc)
+            days = chat_age.days or 1
+
+            if total_count:
+                msgs_per_day = total_count / days
+                print()
+                print(f"Chat age: {days:,} days ({days // 365} years, {(days % 365) // 30} months)")
+                print(f"Avg messages/day: {msgs_per_day:.1f}")
+
+        # Check local coverage first (needed for remaining estimate)
+        local_count = 0
+        try:
+            db = Database()
+            local_count = db.count_messages(peer_id)
+            summary = db.get_coverage_summary(peer_id) if local_count > 0 else None
+            db.close()
+        except Exception:
+            summary = None
+
+        # Sync time estimation
+        if total_count:
+            print()
+            print("=== Sync Estimate ===")
+
+            remaining = max(0, total_count - local_count)
+            if local_count > 0 and remaining > 0:
+                # Show remaining estimate
+                requests_needed, est_seconds = _estimate_sync_time(remaining)
+                print(f"Remaining to sync: ~{remaining:,} messages")
+                print(f"Requests needed: ~{requests_needed:,} ({MSGS_PER_REQUEST} msgs/request)")
+                print(f"Estimated time: {_format_duration(est_seconds)}")
+            elif local_count > 0:
+                print("Chat fully synced!")
+            else:
+                # Full sync estimate
+                requests_needed, est_seconds = _estimate_sync_time(total_count)
+                print(f"Full sync: ~{total_count:,} messages")
+                print(f"Requests needed: ~{requests_needed:,} ({MSGS_PER_REQUEST} msgs/request)")
+                print(f"Estimated time: {_format_duration(est_seconds)}")
+
+            print(f"(Based on ~{REQUESTS_PER_MINUTE} req/min with 20% FloodWait buffer)")
+
+        # Show local coverage
+        print()
+        print("=== Local Coverage ===")
+        if local_count > 0 and summary:
+            print(f"Messages in DB: {local_count:,}")
+
+            if total_count:
+                coverage_pct = (local_count / total_count) * 100
+                print(f"Coverage: {coverage_pct:.1f}%")
+
+            print(f"Synced ranges: {summary['total_ranges']}")
+            if summary['has_gaps']:
+                print(f"Has gaps: Yes ({len(summary['gaps'])} gaps)")
+            else:
+                print("Has gaps: No")
+
+            if summary.get('oldest_date') and summary.get('newest_date'):
+                oldest = summary['oldest_date'].strftime('%Y-%m-%d %H:%M')
+                newest = summary['newest_date'].strftime('%Y-%m-%d %H:%M')
+                print(f"Date range: {oldest} → {newest}")
+        else:
+            print("No local data synced yet.")
+
+        return 0
+
+    except ValueError as e:
+        print(f"Error: {e}")
+        return 1
+    finally:
+        await client.disconnect()
 
 
 async def _sync_date_range_with_gaps(
@@ -647,6 +855,11 @@ async def _fetch_date_range(
     batch: list[dict] = []
     total_fetched = 0
 
+    # Track progress
+    import time
+    start_time = time.time()
+    last_progress_time = start_time
+
     # Fetch messages using offset_date (starts from end_date, goes backwards)
     async for msg in client.iter_messages(
         entity,
@@ -666,13 +879,20 @@ async def _fetch_date_range(
 
         if len(batch) >= batch_size:
             _flush_batch(db, batch, stats)
-            # Show progress with current date
+
+            # Show progress with timing info
+            elapsed = time.time() - start_time
+            rate = total_fetched / elapsed if elapsed > 0 else 0
+
             batch_dates = [m["date"] for m in batch if m["date"]]
             if batch_dates:
                 oldest = min(batch_dates).strftime("%Y-%m-%d %H:%M")
                 newest = max(batch_dates).strftime("%Y-%m-%d %H:%M")
                 target = start_date.strftime("%Y-%m-%d %H:%M")
-                logger.info(f"  +{len(batch)} msgs [{oldest} → {newest}] → target: {target}")
+                logger.info(
+                    f"  +{len(batch)} msgs [{oldest} → {newest}] "
+                    f"→ target: {target} ({total_fetched} total, {rate:.0f} msg/s)"
+                )
             batch = []
 
     # Flush remaining
@@ -696,7 +916,10 @@ async def _fetch_date_range(
         )
         db.commit()
 
-    logger.info(f"Fetched: {total_fetched} msgs, {stats['total_inserted']} new")
+    # Summary with timing
+    elapsed = time.time() - start_time
+    rate = total_fetched / elapsed if elapsed > 0 else 0
+    logger.info(f"Fetched: {total_fetched} msgs, {stats['total_inserted']} new in {_format_duration(elapsed)} ({rate:.0f} msg/s)")
     return stats["total_inserted"]
 
 
