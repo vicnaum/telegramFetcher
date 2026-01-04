@@ -182,6 +182,87 @@ You can specify peers in multiple ways:
 
 > **Note:** Title-based lookup is not supported. Use `dialogs --search "keyword"` to find peer IDs.
 
+## Telegram Chats Packer (`tg_packer.py`)
+
+A companion tool to compress exported chat logs for efficient AI/LLM processing.
+
+### Features
+
+- **Message concatenation** - Consecutive messages from the same user merged with `. `
+- **Media grouping** - `[photo] [photo] [photo]` → `[3 photos]`
+- **Link shortening** - Full URLs → `[x.com link]`, `[@levelsio tweet]`, `[org/repo repo]`
+- **Date headers** - Removes timestamps, shows `# 2025-01-15` for new days
+- **User renaming** - Interactive mode to shorten names (e.g., "Victor Naumik" → "V")
+- **Sensitive data redaction** - API keys, tokens, passwords, mnemonics
+- **Token counting** - Shows estimated AI token count (using tiktoken)
+
+### Usage
+
+```bash
+# Basic usage (interactive user renaming)
+uv run python tg_packer.py pack export.txt
+
+# Non-interactive with all defaults
+uv run python tg_packer.py pack export.txt -n
+
+# With sensitive data redaction
+uv run python tg_packer.py pack export.txt -n --redact
+
+# Custom output file
+uv run python tg_packer.py pack export.txt -n -o compressed.txt
+
+# Analyze without packing (statistics only)
+uv run python tg_packer.py analyze export.txt
+```
+
+### Options
+
+| Option | Short | Description |
+|--------|-------|-------------|
+| `--output` | `-o` | Output file path (default: `input_packed.txt`) |
+| `--no-interactive` | `-n` | Skip interactive user renaming |
+| `--links` | `-l` | Link handling: `full`, `short` (default), `remove` |
+| `--redact` | `-s` | Redact sensitive data (API keys, tokens, etc.) |
+| `--keep-replies` | `-r` | Keep full reply metadata |
+
+### Link Modes
+
+| Mode | Example Input | Example Output |
+|------|--------------|----------------|
+| `full` | `https://x.com/user/status/123` | (unchanged) |
+| `short` | `https://x.com/levelsio/status/123` | `[@levelsio tweet]` |
+| `short` | `https://github.com/org/repo` | `[org/repo repo]` |
+| `remove` | Any URL | `[link]` or `[3 links]` |
+
+### Redaction (`--redact`)
+
+Automatically redacts:
+- JWT tokens, API keys (OpenAI, Google, etc.)
+- Ethereum private keys and long hex strings
+- Mnemonic seed phrases
+- Environment variable secrets (PASSWORD, TOKEN, SECRET, etc.)
+- Database URLs, Supabase/ngrok URLs
+- Any alphanumeric string 16+ chars after `=`
+
+### Example Output
+
+**Before:**
+```
+[12345] 2025-01-01 10:30:00 | Alice | [video]
+[12346] 2025-01-01 10:31:00 | Bob | [reply to #12345 @Alice] Nice video!
+[12347] 2025-01-01 10:31:30 | Bob | Check out this link
+[12348] 2025-01-01 10:31:45 | Bob | https://x.com/someone/status/123456
+```
+
+**After (with user renames A/B):**
+```
+# 2025-01-01
+A: [video]
+B: Nice video!. Check out this link. [@someone tweet]
+```
+
+Typical compression: **55-60% token reduction**
+
 ## Security Notes
 
 ⚠️ **Important:**
