@@ -13,6 +13,8 @@ out.txt
 out.jsonl
 *.export.txt
 *.export.jsonl
+*.txt
+*.jsonl
 
 # Python
 __pycache__/
